@@ -3,8 +3,9 @@
 
 Why this wrapper exists rather than `flashinfer-bench validate`:
 
-* The vendored package is not installed, so it has to go on ``sys.path`` (and on
-  ``PYTHONPATH``, for the runner's worker subprocesses).
+* It resolves the staged root from a task directory, so the two spellings
+  ``tasks/hca_compress_c128`` and ``--root data/trace_sets/...`` both work, and
+  it turns the report into an exit status.
 
 Note what the validator does *not* do: it discovers the dataset from path depth
 and silently skips files at the wrong depth, so a root staged by hand is likely
@@ -18,21 +19,15 @@ Usage:
 """
 
 import argparse
-import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import stage_trace_set  # noqa: E402  (needs the path above)
 
-REPO = stage_trace_set.REPO
-VENDORED = REPO / "third_party" / "flashinfer-bench"
-
-# --- module scope on purpose; see the docstring --------------------------
-sys.path.insert(0, str(VENDORED))
-os.environ["PYTHONPATH"] = os.pathsep.join(
-    [str(VENDORED)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
-)
+# flashinfer_bench resolves through the editable install of the vendored tree
+# (pyproject.toml's [tool.uv.sources]), so no sys.path or PYTHONPATH plumbing is
+# needed here and the validator's subprocesses inherit the same copy.
 import flashinfer_bench  # noqa: E402,F401  (registers the real package)
 
 

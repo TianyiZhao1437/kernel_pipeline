@@ -47,8 +47,6 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import stage_trace_set  # noqa: E402  (needs the path above)
 
-REPO = stage_trace_set.REPO
-
 ITEMSIZE = {
     "float32": 4,
     "bfloat16": 2,
@@ -114,7 +112,6 @@ def main():
     args = ap.parse_args()
 
     root = args.root or stage_trace_set.default_root(args.task_dir)
-    sys.path.insert(0, str(REPO / "third_party" / "flashinfer-bench"))
     from flashinfer_bench.data import TraceSet
 
     trace_set = TraceSet.from_path(str(root))

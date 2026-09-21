@@ -1,0 +1,42 @@
+[project]
+name = "kernel-pipeline"
+version = "0.1.0"
+description = "GPU kernel tasks and traces in the flashinfer-bench format, targeting H200."
+requires-python = ">=3.10"
+
+# flashinfer-bench comes from the pinned copy under third_party/, never from
+# PyPI -- see third_party/VENDOR.md for why this repository vendors rather than
+# tracks, and third_party/patches/ for the local patch series. The path source
+# below is what binds the name to that copy.
+dependencies = [
+    "flashinfer-bench",
+    "torch>=2.8.0",
+    "safetensors>=0.5.0",
+    "pyyaml>=6.0",
+    "transformers>=5.0.0",   # tools/model_probe.py reads DeepSeek-V4 natively
+    "huggingface-hub>=0.26",
+]
+
+[tool.uv.sources]
+flashinfer-bench = { path = "third_party/flashinfer-bench", editable = true }
+
+[tool.uv]
+# This repository is scripts and data, not an importable package.
+package = false
+
+# Installing
+# ----------
+#
+#     uv pip install --no-deps -e third_party/flashinfer-bench
+#
+# --no-deps is not optional. This environment pins torch 2.11.0+cu128 and
+# triton 3.6.0 to match the host driver and the H200's compute capability; a
+# resolver given a free hand can satisfy flashinfer-bench's `torch>=2.8.0` by
+# replacing that pin with a CPU or wrong-CUDA wheel, and the failure shows up
+# much later as "no kernel image is available for execution on the device".
+# Every one of flashinfer-bench's seven dependencies is already present, so
+# --no-deps resolves to exactly the editable link and nothing else.
+#
+# Editable, and pointed at the vendored tree, so that third_party/patches/ is
+# live: `import flashinfer_bench` picks up the patched files with no build step
+# and no PYTHONPATH prefix.

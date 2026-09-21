@@ -24,7 +24,6 @@ Usage:
 """
 
 import argparse
-import os
 import pathlib
 import sys
 import time
@@ -32,28 +31,20 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import stage_trace_set  # noqa: E402  (needs the path above)
 
-REPO = stage_trace_set.REPO
-VENDORED = REPO / "third_party" / "flashinfer-bench"
-
-# --- module scope on purpose ---------------------------------------------
+# Import the real package before anything touches fib_shim, which registers a
+# stub `flashinfer_bench` so the schema parsers load without the package
+# __init__ (tools/fib_shim.py). Benchmark needs the real __init__; both shim
+# helpers no-op when the module is already in sys.modules, so importing for
+# real first makes the shim defer to it.
 #
-# The vendored package is not installed, so it goes on the path here; PYTHONPATH
-# carries it to the runner's worker subprocesses as well.
+# flashinfer_bench resolves through the editable install of the vendored tree
+# (pyproject.toml's [tool.uv.sources]), so it needs no path plumbing here and
+# the runner's spawned workers inherit it without a PYTHONPATH prefix.
 #
-# It must run before anything touches fib_shim, which registers a stub
-# `flashinfer_bench` so the schema parsers load without the package __init__
-# (tools/fib_shim.py). Benchmark needs the real __init__; both shim helpers
-# no-op when the module is already in sys.modules, so importing for real first
-# makes the shim defer to it.
-#
-# There is no evaluator registration here any more. hca_compress is routed to
+# There is no evaluator registration here either. hca_compress is routed to
 # LowBitEvaluator and given its tolerance inside the vendored tree
 # (third_party/patches/002-hca-compress-eval-routing.patch), so the stock
-# resolver finds it in the parent and in every spawned worker alike.
-sys.path.insert(0, str(VENDORED))
-os.environ["PYTHONPATH"] = os.pathsep.join(
-    [str(VENDORED)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
-)
+# resolver finds it in the parent and in every worker alike.
 import flashinfer_bench  # noqa: E402,F401  (registers the real package)
 
 
