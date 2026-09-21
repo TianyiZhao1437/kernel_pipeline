@@ -8,12 +8,19 @@
 #
 #   ./third_party/patches/apply.sh           apply
 #   ./third_party/patches/apply.sh --check   dry run, report only
+#   ./third_party/patches/apply.sh [--check] <tree>   use <tree> instead of the
+#                                            vendored one -- how to verify that
+#                                            the series still replays cleanly
+#                                            onto a pristine copy
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-tree="$(dirname "$here")/flashinfer-bench"
 check=""
-[ "${1:-}" = "--check" ] && check="--check"
+if [ "${1:-}" = "--check" ]; then
+    check="--check"
+    shift
+fi
+tree="${1:-$(dirname "$here")/flashinfer-bench}"
 
 for p in "$here"/[0-9][0-9][0-9]-*.patch; do
     name="$(basename "$p")"

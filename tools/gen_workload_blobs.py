@@ -20,7 +20,7 @@ two of the five inputs physically impossible and a third unrepresentative:
   ``rms_norm_weight`` that sets the per-channel magnitudes the FP8 block
   quantiser then has to cover.
 * ``kv_state``/``score_state`` as N(0,1) are light-tailed. Measured on real
-  DeepSeek-V2-Lite activations, the hidden state has **kurtosis 429** and the
+  DeepSeek-V2-Lite activations, the hidden state has **kurtosis 405** and the
   MLA KV latent **245**, against 3.0 for a Gaussian -- the "massive activation"
   channels that every KV-quantisation paper is about, and the reason UE8M0
   carries a scale per 64 elements instead of one per tensor.
@@ -85,6 +85,25 @@ be mixed:
 * ``kv_state``/``score_state`` are blobbed only for ``num_compressed <= 128``
   (~110 MB); above that they stay random, because those workloads exist to
   measure bandwidth and 780 MB of blob would buy nothing.
+
+Reproducibility
+---------------
+
+The blobs are a pure function of four things, all pinned:
+
+    the frozen corpus          tools/corpus/hca_v1.txt, sha256 asserted
+    DeepSeek-V2-Lite           a hub revision, for the activation harvest
+    DeepSeek-V4-Flash          a hub revision, for wkv/wgate/ape/norm/rope
+    workload_seed(uuid)        crc32, stable across processes
+
+Two of those were broken until this was written down. ``hash(uuid)`` is salted
+per process, so the "seed" changed on every invocation; and the corpus was built
+live from ``tasks/HCA.md``, making the workload data a function of the task's own
+write-up. Both are fixed, and ``tasks/hca_compress_c128/blobs.sha256`` records
+the digest of every blob so a rebuild can be checked rather than assumed.
+
+Regenerating the blobs invalidates every recorded trace: the traces describe
+measurements on specific input bytes. Re-run tools/run_benchmark.py after.
 """
 
 from __future__ import annotations
@@ -93,6 +112,7 @@ import argparse
 import json
 import pathlib
 import sys
+import zlib
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -108,6 +128,34 @@ REPO = mp.REPO
 BLOB_KV_MAX_NUM_COMPRESSED = 128
 
 SEED = 0x11CA
+
+# The three stress workloads, keyed by uuid: {uuid: (mode, num_compressed)}.
+#
+# Keyed rather than appended-in-order because the Workload schema has nowhere to
+# put a generator mode -- `axes` is Dict[str, int] and there is no free-form
+# field -- so once a stress workload is written into the sweep, the jsonl alone
+# cannot say it was anything other than `real`. Regenerating from that file
+# previously rebuilt all three with the real distribution and no warning, which
+# quietly deleted the coverage they exist for (`tiny` is the only input in the
+# repository that reaches the reference's clamp(min=1e-4)). The uuid is the
+# stable identity, so the mapping lives here.
+STRESS_WORKLOADS = {
+    "00000000-0000-4128-8001-000000000000": ("flat", 64),
+    "00000000-0000-4128-8001-000000000001": ("peaked", 64),
+    "00000000-0000-4128-8001-000000000002": ("tiny", 64),
+}
+
+
+def workload_seed(uuid: str) -> int:
+    """A stable per-workload seed.
+
+    ``hash(uuid)`` was used here and is wrong: Python salts str hashing per
+    process (PYTHONHASHSEED), so every invocation produced different blobs for
+    the same workload while the docstring above claimed the generator was
+    seeded. ``zlib.crc32`` is specified, stable across processes, versions and
+    platforms, and is used here only to spread uuids -- not as a checksum.
+    """
+    return SEED ^ zlib.crc32(uuid.encode())
 
 
 def _lift_channels(h: torch.Tensor, out_channels: int, seed: int) -> torch.Tensor:
@@ -263,14 +311,16 @@ def main() -> int:
     norm_w = gen.w["norm"]
 
     if args.stress:
-        base_uuid = "00000000-0000-4128-8001-%012d"
-        for i, (mode, n) in enumerate([("flat", 64), ("peaked", 64), ("tiny", 64)]):
+        have = {tr["workload"]["uuid"] for tr in traces}
+        for uuid, (mode, n) in STRESS_WORKLOADS.items():
+            if uuid in have:
+                continue  # already in the sweep; its mode comes from STRESS_WORKLOADS
             traces.append({
                 "definition": def_name, "solution": None,
-                "workload": {"uuid": base_uuid % i,
+                "workload": {"uuid": uuid,
                              "axes": {"num_compressed": n, "max_position": n * 128},
                              "inputs": {}, },
-                "evaluation": None, "_mode": mode,
+                "evaluation": None,
             })
 
     blob_dir = root / "blob" / "workloads" / op_type / def_name
@@ -283,10 +333,10 @@ def main() -> int:
           f"{'uniq':>5} {'clamp%':>7} {'smax':>6} {'MB':>7}")
     for tr in traces:
         wl = tr["workload"]
-        mode = tr.pop("_mode", "real")
         n = wl["axes"]["num_compressed"]
         maxpos = wl["axes"]["max_position"]
         uuid = wl["uuid"]
+        mode = STRESS_WORKLOADS.get(uuid, (None,))[0] or "real"
 
         tensors: Dict[str, torch.Tensor] = {}
         cos, sin = mp.rope_tables(maxpos)
@@ -296,7 +346,7 @@ def main() -> int:
 
         blob_kv = mode != "real" or n <= args.kv_max
         if blob_kv:
-            kv, score = gen.states(n, seed=SEED ^ hash(uuid) & 0xFFFFFFFF, mode=mode)
+            kv, score = gen.states(n, seed=workload_seed(uuid), mode=mode)
             tensors["kv_state"] = kv
             tensors["score_state"] = score
             stats = exponent_stats(kv, score, norm_w, args.device)

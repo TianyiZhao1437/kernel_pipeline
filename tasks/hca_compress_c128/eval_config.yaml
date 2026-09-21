@@ -7,7 +7,7 @@
 # semantic mutations injected. A usable configuration must accept the solution at
 # every workload and reject all eight mutations. Observed separation:
 #
-#     solution, worst matched_ratio over the sweep   0.99998692
+#     solution, worst matched_ratio over the sweep   0.99998256
 #     worst mutation, min matched_ratio               0.96282
 #
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@
 # required_matched_ratio = 0.999
 #
 # Two-sided: 0.00098 of headroom above the solution's worst observation (it
-# could get ~75x noisier and still pass) and 0.036 of margin below the least
+# could get ~57x noisier and still pass) and 0.036 of margin below the least
 # severe mutation (rejected by a factor of ~37). Note that this ratio applies
 # uniformly to every output, which is acceptable here only because ckv_fp8 is
 # the sensitive one -- the quantisation mutations it catches show up at 0.0098
@@ -98,15 +98,25 @@
 #                       weights and h lifted from real DeepSeek-V2-Lite hidden
 #                       states (kurtosis 429 vs 3.0 for a Gaussian)
 #
-# What that bought, over the whole sweep:
+# What that bought, measured over the whole sweep. The unit is the 64-element
+# quantisation block -- one UE8M0 exponent each -- and the three stress
+# workloads are counted separately because the clamp coverage comes entirely
+# from one of them:
 #
-#                        UE8M0 exponents seen   distinct   clamp(1e-4) hit
-#   randn (before)       [-8, -4]                      5   0/24913  (0.00%)
-#   real  (after)        [-22, -7]                     7   443/26257 (1.69%)
+#                              exponents seen   distinct   clamp(1e-4) hit
+#   randn (before)             [-8, -4]                5   none (0/24913)
+#   real, 11 sweep workloads   [-11, -7]               5   none (0/2961)
+#   + the 3 stress workloads   [-22, -7]               7   440/4305 (10.22%)
 #
-# The representable range is [-22, 120], so this is still one-sided -- real
-# activations do not produce huge-magnitude blocks either -- but the span is
-# 15 exponents instead of 4, and the lower bound is now *exactly* the clamp.
+# (The randn row is the earlier all-random sweep, so its denominator counts a
+# different set of workloads; only the exponents and the zero are comparable.)
+#
+# So real activations alone widen the span from 4 exponents to 5 and shift it
+# down by three, but they do not reach the clamp -- nothing the model actually
+# produces has a 64-element block whose absmax falls below 1e-4. Reaching it is
+# what `tiny` is for. The representable range is [-22, 120], so coverage is
+# still one-sided at the top: neither real nor synthetic input here produces
+# huge-magnitude blocks, and that is the honest limit of this sweep.
 #
 # Above num_compressed = 128 the two large inputs stay random: those workloads
 # exist to measure bandwidth, and input values cannot change a bandwidth number
@@ -118,9 +128,10 @@
 #
 # Previously noted here as open: `{"type": "random"}` never produced a
 # 64-element block whose absmax fell below 1e-4, so removing the clamp from the
-# reference changed no output. The `tiny` stress workload (kv_state scaled to
-# ~1e-7) now drives 98.9% of its blocks under the clamp and both solutions pass
-# it at matched_ratio = 1.00000000.
+# reference changed no output. Real activations do not reach it either (table
+# above). The `tiny` stress workload (kv_state scaled to ~1e-7) drives 98.2% of
+# its blocks under the clamp and both solutions pass it at
+# matched_ratio = 1.00000000.
 #
 # Three stress workloads share num_compressed = 64 with the sweep's own n=64
 # and differ only in their input distribution, which also makes them a
@@ -128,19 +139,21 @@
 # different data:
 #
 #   mode      softmax max   e range    triton ms   baseline ms (harness)
-#   real            0.074   [-11, -7]     0.1338          0.2078
-#   flat            0.008   [-11, -8]     0.1337          0.1202
-#   peaked          0.841   [-11, -8]     0.1336          0.1166
-#   tiny            0.074   [-22,-21]     0.1336          0.1203
+#   real            0.073   [-11, -8]     0.1340          0.5161
+#   flat            0.008   [-11, -9]     0.1337          0.5379
+#   peaked          0.838   [-11, -8]     0.1337          0.5321
+#   tiny            0.076   [-22,-21]     0.1339          0.5168
 #
 # A 100x swing in softmax concentration and a 1e-7 rescale move the Triton
-# kernel's latency by 0.15%. The baseline's 1.78x spread is not a data effect
-# either: flat/peaked/tiny differ most from each other and agree to 3%, and the
-# outlier is `real`, which runs ninth in the sweep while the others run last.
-# Timing all four in one process gives 0.0896-0.0935 ms cold and
-# 0.1034-0.1072 ms after the 17 shapes are compiled -- i.e. the spread tracks
-# torch.compile's guard state, not the inputs (tasks/HCA.md 7.7). Input values
-# buy correctness coverage here, not performance signal.
+# kernel's latency by 0.22%, and the PyTorch baseline by 4%. Input values buy
+# correctness coverage here, not performance signal.
+#
+# (An earlier revision of this table showed the baseline spanning 0.1166-0.2078
+# ms -- a 1.78x spread that had to be explained away as torch.compile guard
+# state rather than a data effect, since the outlier was `real`, which runs
+# ninth in the sweep while the others run last. That spread did not survive
+# regenerating the blobs: the four now agree to 4% and the ordering artefact is
+# gone. The conclusion is the same one, now without the caveat.)
 #
 # Note that the outputs are compared as-is: the evaluator casts ckv_fp8 to
 # float32 and compares the raw e4m3 code points. It does NOT dequantise by

@@ -46,6 +46,13 @@ searched. A missing blob is a hard error rather than a warning: the workload
 would otherwise load fine here and fail at ``gen_inputs`` time, several minutes
 into a benchmark.
 
+If the task carries a ``blobs.sha256`` manifest, every staged blob is also
+checked against it. That is not belt-and-braces: the fallback search matches on
+the root-relative path alone, and blob filenames are workload uuids, which are
+stable across regenerations -- so a root built from a different corpus or a
+different seed has exactly the paths being looked for and satisfies the lookup
+silently.
+
 Usage:
     python3 tools/stage_trace_set.py tasks/hca_compress_c128
     python3 tools/stage_trace_set.py tasks/hca_compress_c128 --root /tmp/ts
@@ -167,8 +174,58 @@ def stage(
     if blobs:
         nbytes = sum((root / r).stat().st_size for r in blobs)
         log(f"  blobs       {len(blobs):>3} safetensors  ({nbytes / 2**20:.1f} MB)")
+        _verify_blobs(task_dir, root, blobs, log)
 
     return root
+
+
+def _verify_blobs(
+    task_dir: pathlib.Path, root: pathlib.Path, blobs: set, log
+) -> None:
+    """Check the staged blobs against the task's sha256 manifest, if it has one.
+
+    Worth the second of hashing because ``_find_blob`` will take a blob from any
+    other root under data/trace_sets/ that happens to have the same relative
+    path, first match by sort order wins. Blobs are named by workload uuid and
+    the uuids are stable across regenerations, so a root built from an older
+    corpus or an older seed has exactly the paths being looked for and satisfies
+    the lookup silently. Nothing downstream would notice: SafetensorsInput
+    carries no digest, and a Trace names its definition and solution by name
+    with no content hash, so the run would simply record new numbers under the
+    old workload's identity.
+    """
+    manifest = task_dir / "blobs.sha256"
+    if not manifest.exists():
+        return
+    import hashlib
+
+    want = {}
+    for line in manifest.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, _, rel = line.partition("  ")
+        want[rel] = digest
+
+    bad = []
+    for rel in sorted(blobs):
+        expected = want.get(rel)
+        if expected is None:
+            bad.append(f"  {rel}: referenced by a workload but absent from blobs.sha256")
+            continue
+        got = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        if got != expected:
+            bad.append(f"  {rel}\n    expected {expected}\n    got      {got}")
+    if bad:
+        raise SystemExit(
+            f"staged blobs do not match {manifest}:\n" + "\n".join(bad) + "\n\n"
+            "Either a stale blob was picked up from another root under "
+            "data/trace_sets/ (pass --blobs to name the right one), or the blobs "
+            "were regenerated and every recorded trace is now stale. In the "
+            "latter case re-run tools/gen_workload_blobs.py, refresh the manifest, "
+            "and re-run tools/run_benchmark.py -- do not just update the manifest."
+        )
+    log(f"  blobs       verified against {manifest.name}")
 
 
 def _find_blob(

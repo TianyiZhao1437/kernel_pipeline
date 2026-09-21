@@ -1,0 +1,2523 @@
+# ===== flashinfer_bench/data/definition.py =====
+"""The definition of kernels in the FlashInfer Trace schema."""
+
+from __future__ import annotations
+
+import ast
+from enum import Enum
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+
+from pydantic import BaseModel, Field, model_validator
+
+from flashinfer_bench.data.utils import BaseModelWithDocstrings, NonEmptyString, NonNegativeInt
+from flashinfer_bench.utils import dtype_str_to_torch_dtype
+
+if TYPE_CHECKING:
+    import torch
+
+
+class AxisConst(BaseModelWithDocstrings):
+    """Constant axis with a fixed value.
+
+    A constant axis represents a dimension that has a fixed, compile-time known value.
+    This is useful for dimensions that don't vary across different instances of the
+    same kernel definition, such as embedding dimensions or hidden layer sizes.
+    """
+
+    type: Literal["const"] = "const"
+    """The type identifier for constant axes."""
+    value: NonNegativeInt
+    """The constant integer value of this axis dimension."""
+    description: Optional[str] = None
+    """An optional human-readable description explaining the purpose of this axis."""
+
+
+class AxisVar(BaseModel):
+    """Variable axis that can be specified at runtime.
+
+    A variable axis represents a dimension whose value is determined at runtime
+    based on the actual input data. Its value will be bound to the input tensor
+    dimension at runtime.
+    """
+
+    type: Literal["var"] = "var"
+    """The type identifier for variable axes."""
+    description: Optional[str] = Field(default=None)
+    """An optional human-readable description explaining the purpose of this axis."""
+
+
+class DType(str, Enum):
+    """Supported data types for tensors.
+
+    Enumeration of all data types that can be used in tensor specifications.
+    Includes both floating-point and integer types commonly used in machine
+    learning and high-performance computing applications.
+    """
+
+    FLOAT32 = "float32"
+    """32-bit IEEE 754 floating point."""
+    FLOAT16 = "float16"
+    """16-bit IEEE 754 half-precision floating point."""
+    BFLOAT16 = "bfloat16"
+    """16-bit Brain Floating Point format."""
+    FLOAT8_E4M3FN = "float8_e4m3fn"
+    """8-bit floating point with 4 exponent bits and 3 mantissa bits."""
+    FLOAT8_E5M2 = "float8_e5m2"
+    """8-bit floating point with 5 exponent bits and 2 mantissa bits."""
+    FLOAT4_E2M1 = "float4_e2m1"
+    """4-bit floating point with 2 exponent bits and 1 mantissa bit."""
+    INT64 = "int64"
+    """64-bit signed integer."""
+    INT32 = "int32"
+    """32-bit signed integer."""
+    INT16 = "int16"
+    """16-bit signed integer."""
+    INT8 = "int8"
+    """8-bit signed integer."""
+    BOOL = "bool"
+    """Boolean type."""
+
+
+class TensorSpec(BaseModelWithDocstrings):
+    """Specification for a tensor including shape and data type, to use as input or output of a
+    kernel.
+
+    This includes the symbolic shape (referencing defined axes) and the data type.
+    Scalars are represented with a None shape.
+    """
+
+    shape: Optional[List[NonEmptyString]]
+    """List of axis names defining the tensor shape. None for scalar values."""
+    dtype: DType
+    """The data type of all elements in this tensor."""
+    description: Optional[str] = None
+    """An optional human-readable description of this tensor's purpose and usage."""
+
+
+AxisSpec = Union[AxisConst, AxisVar]
+"""Union type representing all possible axis specifications."""
+
+
+class Definition(BaseModelWithDocstrings):
+    """Complete definition of a computational workload.
+
+    A Definition provides a formal, machine-readable specification for a computational
+    workload. It defines the tensor formats, dimension semantics, and computational
+    logic through a reference implementation. This serves as the single source of
+    truth for kernel development and optimization.
+    """
+
+    name: NonEmptyString
+    """A unique, human-readable name for the kernel definition."""
+    op_type: NonEmptyString
+    """The general compute category (e.g., 'gemm', 'gqa_ragged', 'mla_paged', 'moe')."""
+    axes: Dict[NonEmptyString, Union[AxisConst, AxisVar]]
+    """Dictionary of symbolic dimensions used in tensor shapes. The axes will be bound to the
+    input tensor dimensions at runtime."""
+    inputs: Dict[NonEmptyString, TensorSpec]
+    """Named input tensors required by this kernel. The order of inputs is preserved as the
+    kernel's interface."""
+    outputs: Dict[NonEmptyString, TensorSpec]
+    """Named output tensors produced by this kernel. The names of the output must not overlap
+    with the names of the inputs. The order of outputs is preserved as the kernel's interface."""
+    reference: NonEmptyString
+    """Reference implementation code. It defines the compute logic of the kernel. Must be a valid
+    Python code with a 'run' function that takes the input tensors and returns the output tensors.
+    """
+    tags: List[NonEmptyString] = Field(default_factory=list)
+    """Optional list of tags for grouping and filtering kernels. It's used in the FlashInfer-Bench
+    website."""
+    description: Optional[str] = Field(default=None)
+    """Optional human-readable description of the kernel's purpose."""
+    constraints: List[NonEmptyString] = Field(default_factory=list)
+    """Optional list of constraint expressions describing relationships between axes."""
+
+    @model_validator(mode="after")
+    def _validate_reference_code(self) -> Definition:
+        """Validate that reference contains valid Python code with a 'run' function.
+
+        Raises
+        ------
+        ValueError
+            If the reference code is not valid Python syntax or doesn't contain
+            a top-level 'run' function.
+        """
+        try:
+            mod = ast.parse(self.reference, mode="exec")
+        except SyntaxError as e:
+            raise ValueError(f"Reference must be valid Python code: {e}") from e
+
+        # Check for 'run' function
+        has_run_func = any(
+            isinstance(node, ast.FunctionDef) and node.name == "run" for node in mod.body
+        )
+        if not has_run_func:
+            raise ValueError("Reference must define a top-level function named 'run'")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_input_output_names(self) -> Definition:
+        """Validate that input and output names are unique and do not overlap.
+
+        Raises
+        ------
+        ValueError
+            If the input or output names are not unique or overlap.
+        """
+        if set(self.inputs.keys()) & set(self.outputs.keys()):
+            raise ValueError("Input and output names must not overlap")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_constraints_syntax(self) -> Definition:
+        """Validate that constraints are valid Python expressions.
+
+        Raises
+        ------
+        ValueError
+            If any constraint is not a valid Python expression.
+        """
+        if self.constraints is not None:
+            for constraint in self.constraints:
+                try:
+                    ast.parse(constraint, mode="eval")
+                except SyntaxError as e:
+                    raise ValueError(f"Constraints must be valid Python expressions: {e}") from e
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tensor_axis_references(self) -> Definition:
+        """Validate that tensor shapes reference defined axes.
+
+        Ensures that all axis names used in input and output tensor shapes
+        are properly defined in the axes dictionary.
+
+        Raises
+        ------
+        ValueError
+            If any tensor shape references an undefined axis.
+        """
+        all_tensors = {**self.inputs, **self.outputs}
+
+        for tensor_name, tensor_spec in all_tensors.items():
+            if tensor_spec.shape is not None:
+                for axis_name in tensor_spec.shape:
+                    if axis_name not in self.axes:
+                        tensor_type = "input" if tensor_name in self.inputs else "output"
+                        raise ValueError(
+                            f'{tensor_type.capitalize()} "{tensor_name}" references undefined '
+                            f'axis "{axis_name}"'
+                        )
+        return self
+
+    @cached_property
+    def const_axes(self) -> Dict[str, int]:
+        """Get all constant axes and their values.
+
+        Returns
+        -------
+        Dict[str, int]
+            Dictionary mapping constant axis names to their fixed values.
+        """
+        return {name: axis.value for name, axis in self.axes.items() if isinstance(axis, AxisConst)}
+
+    @cached_property
+    def var_axes(self) -> List[str]:
+        """Get all variable axis names.
+
+        Returns
+        -------
+        List[str]
+            List of all variable axis names defined in this Definition.
+        """
+        return [name for name, axis in self.axes.items() if isinstance(axis, AxisVar)]
+
+    @cached_property
+    def var_axes_bindings(self) -> Dict[str, Tuple[str, int]]:
+        """Get the bindings of variable axes to input tensor dimensions.
+
+        Determines which input tensor and dimension index corresponds to each
+        variable axis. If multiple input tensors share the same axis, the
+        binding will be to the first tensor encountered.
+
+        Returns
+        -------
+        Dict[str, Tuple[str, int]]
+            Dictionary mapping axis names to tuples of (input_tensor_name, dimension_index).
+            Only includes variable axes that appear in input tensor shapes.
+        """
+        bindings: Dict[str, Tuple[str, int]] = {}
+        for inp_name, spec in self.inputs.items():
+            if spec.shape is None:  # scalar, no shape
+                continue
+            for dim_idx, axis in enumerate(spec.shape):
+                ax_def = self.axes.get(axis)
+                if isinstance(ax_def, AxisVar) and axis not in bindings:
+                    bindings[axis] = (inp_name, dim_idx)
+        return bindings
+
+    def get_axes_values(self, input_shapes: Iterable[Optional[Tuple[int, ...]]]) -> Dict[str, int]:
+        """Get concrete variable axis values from input shapes.
+
+        Parameters
+        ----------
+        input_shapes : Iterable[Optional[Tuple[int, ...]]]
+            Iterable of input tensor shapes.
+
+        Returns
+        -------
+        Dict[str, int]
+            Dictionary mapping variable axis names to their concrete values.
+
+        Raises
+        ------
+        ValueError
+            If a required variable axis value is missing from input_shapes, or a axis occurs in
+            multiple input tensors, but the values are not consistent.
+        """
+        var_axes_values: Dict[str, int] = {}
+        for (inp_name, inp_spec), inp_shape in zip(self.inputs.items(), input_shapes):
+            if inp_spec.shape is None:  # scalar, no shape
+                continue
+            if len(inp_spec.shape) != len(inp_shape):
+                raise ValueError(
+                    f"Input '{inp_name}''s defined dimension is {len(inp_spec.shape)} but the "
+                    f"actual dimension is {len(inp_shape)}"
+                )
+            for axis_name, axis_value in zip(inp_spec.shape, inp_shape):
+                if axis_name in self.axes and self.axes[axis_name].type == "var":
+                    if axis_name in var_axes_values:
+                        if var_axes_values[axis_name] != axis_value:
+                            raise ValueError(
+                                f"Axis '{axis_name}' has different values for different input "
+                                f"tensors: {var_axes_values[axis_name]} and {axis_value}"
+                            )
+                    else:
+                        var_axes_values[axis_name] = axis_value
+
+        if len(var_axes_values) != len(self.var_axes):
+            raise ValueError(
+                f"Missing values for variable axes: "
+                f"{set(self.var_axes) - set(var_axes_values.keys())}"
+            )
+        return var_axes_values
+
+    def get_axes_values_from_inputs(self, inputs: Iterable[Any]) -> Dict[str, int]:
+        """Get concrete variable axis values directly from input values.
+
+        Convenience method that combines extract_shapes and get_var_axes_values.
+
+        Parameters
+        ----------
+        inputs : Iterable[Any]
+            Iterable of input values (tensors or other types).
+
+        Returns
+        -------
+        Dict[str, int]
+            Dictionary mapping variable axis names to their concrete values.
+        """
+        shapes = [tuple(val.shape) if hasattr(val, "shape") else None for val in inputs]
+        return self.get_axes_values(shapes)
+
+    def _get_shapes(
+        self, tensors: Iterable[TensorSpec], var_axes_values: Optional[Dict[str, int]] = None
+    ) -> List[Optional[Tuple[int, ...]]]:
+        """Get concrete tensor shapes given variable axis values.
+
+        Parameters
+        ----------
+        tensors : List[TensorSpec]
+            List of tensor specifications to compute shapes for.
+        var_values : Optional[Dict[str, int]], default=None
+            Values for variable axes. If None, defaults to empty dictionary.
+
+        Returns
+        -------
+        List[Optional[Tuple[int, ...]]]
+            List of concrete shapes as tuples of integers. None for scalar tensors.
+
+        Raises
+        ------
+        ValueError
+            If a required variable axis value is missing from var_values.
+        """
+        var_axes_values = var_axes_values or {}
+        shapes = []
+
+        for tensor_spec in tensors:
+            if tensor_spec.shape is None:  # scalar, no shape
+                shapes.append(None)
+                continue
+            shape = []
+            for axis_name in tensor_spec.shape:
+                axis = self.axes[axis_name]
+                if isinstance(axis, AxisConst):
+                    shape.append(axis.value)
+                elif isinstance(axis, AxisVar):
+                    if axis_name not in var_axes_values:
+                        raise ValueError(f"Missing value for variable axis '{axis_name}'")
+                    shape.append(var_axes_values[axis_name])
+            shapes.append(shape)
+
+        return shapes
+
+    def get_input_shapes(
+        self, var_axes_values: Optional[Dict[str, int]] = None
+    ) -> List[Optional[Tuple[int, ...]]]:
+        """Get concrete input shapes given variable axis values.
+
+        Parameters
+        ----------
+        var_values : Optional[Dict[str, int]], default=None
+            Values for variable axes. If None, defaults to empty dictionary.
+
+        Returns
+        -------
+        Dict[str, List[int]]
+            Dictionary mapping input tensor names to their concrete shapes.
+
+        Raises
+        ------
+        ValueError
+            If a required variable axis value is missing from var_values.
+        """
+        return self._get_shapes(self.inputs.values(), var_axes_values)
+
+    def get_output_shapes(
+        self, var_values: Optional[Dict[str, int]] = None
+    ) -> List[Optional[Tuple[int, ...]]]:
+        """Get concrete output shapes given variable axis values.
+
+        Parameters
+        ----------
+        var_values : Optional[Dict[str, int]], default=None
+            Values for variable axes. If None, defaults to empty dictionary.
+
+        Returns
+        -------
+        Dict[str, List[int]]
+            Dictionary mapping output tensor names to their concrete shapes.
+
+        Raises
+        ------
+        ValueError
+            If a required variable axis value is missing from var_values.
+        """
+        return self._get_shapes(self.outputs.values(), var_values)
+
+    @cached_property
+    def torch_input_dtypes(self) -> List[torch.dtype]:
+        """Get the torch data types of the input tensors.
+
+        Returns
+        -------
+        List[torch.dtype]
+            List of torch data types of the input tensors.
+        """
+        return [dtype_str_to_torch_dtype(spec.dtype) for spec in self.inputs.values()]
+
+    @cached_property
+    def torch_output_dtypes(self) -> List[torch.dtype]:
+        """Get the torch data types of the output tensors.
+
+        Returns
+        -------
+        List[torch.dtype]
+            List of torch data types of the output tensors.
+        """
+        return [dtype_str_to_torch_dtype(spec.dtype) for spec in self.outputs.values()]
+
+    def merge_kwargs_to_args(
+        self, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Tuple[Any, ...]:
+        """Merge keyword arguments into positional arguments based on input/output order.
+
+        Parameters
+        ----------
+        args : Tuple[Any, ...]
+            Positional arguments.
+        kwargs : Dict[str, Any]
+            Keyword arguments to merge.
+
+        Returns
+        -------
+        Tuple[Any, ...]
+            Merged positional arguments in the order: inputs, then outputs.
+        """
+        if not kwargs:
+            return args
+
+        param_names = list(self.inputs.keys()) + list(self.outputs.keys())
+
+        if len(args) > len(param_names):
+            raise TypeError(
+                f"Too many positional arguments: got {len(args)}, "
+                f"expected at most {len(param_names)}"
+            )
+
+        # Check for duplicate arguments
+        positional_arg_names = set(param_names[: len(args)])
+        for name in kwargs:
+            if name in positional_arg_names:
+                raise TypeError(f"Got multiple values for argument '{name}'")
+
+        result = list(args)
+        for i in range(len(args), len(param_names)):
+            name = param_names[i]
+            if name in kwargs:
+                result.append(kwargs[name])
+            else:
+                break
+        return tuple(result)
+
+
+# ===== flashinfer_bench/data/workload.py =====
+"""Specification for workloads, which defines the input tensors for a kernel."""
+
+from typing import Dict, Literal, Union
+
+from .utils import BaseModelWithDocstrings, NonEmptyString, NonNegativeInt
+
+
+class RandomInput(BaseModelWithDocstrings):
+    """Random input generation descriptor.
+
+    Represents a specification for generating random tensor input data
+    during workload execution and benchmarking.
+    """
+
+    type: Literal["random"] = "random"
+    """The input type identifier for random data generation."""
+
+
+class ScalarInput(BaseModelWithDocstrings):
+    """Scalar literal input specification.
+
+    Represents a scalar value (integer, float, or boolean) that will be
+    used as a direct input parameter to the computational workload.
+    """
+
+    type: Literal["scalar"] = "scalar"
+    """The input type identifier for scalar values."""
+    value: Union[int, float, bool]
+    """The scalar value to be used as input. Must be int, float, or bool."""
+
+
+class SafetensorsInput(BaseModelWithDocstrings):
+    """Input specification for data loaded from safetensors files.
+
+    Represents tensor data that will be loaded from a safetensors file
+    using a specific tensor key within that file.
+    """
+
+    type: Literal["safetensors"] = "safetensors"
+    """The input type identifier for safetensors data."""
+    path: NonEmptyString
+    """Path to the safetensors file containing the tensor data. The path is relative to the root
+    path of the TraceSet."""
+    tensor_key: NonEmptyString
+    """Key identifier for the specific tensor within the safetensors file."""
+
+
+InputSpec = Union[RandomInput, SafetensorsInput, ScalarInput]
+"""Union type representing all possible input specification types."""
+
+
+class Workload(BaseModelWithDocstrings):
+    """Concrete workload configuration for benchmarking.
+
+    Defines a specific instance of a computational workload with concrete
+    values for all variable axes and specifications for all input data.
+    This represents an executable configuration that can be benchmarked.
+    """
+
+    axes: Dict[str, NonNegativeInt]
+    """Dictionary mapping axis names to their concrete integer values. All values must be
+    positive."""
+    inputs: Dict[str, InputSpec]
+    """Dictionary mapping input names to their data specifications."""
+    uuid: NonEmptyString
+    """Unique identifier for this specific workload configuration."""
+
+
+# ===== flashinfer_bench/data/solution.py =====
+"""Strong-typed data definitions for solution implementations."""
+
+import hashlib
+from enum import Enum
+from pathlib import Path
+from typing import Any, List, Optional
+
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator
+
+from .utils import BaseModelWithDocstrings, NonEmptyString
+
+
+class SupportedLanguages(str, Enum):
+    """Supported programming languages for solution implementations.
+
+    Enumeration of programming languages that can be used to implement
+    solutions for computational workloads.
+    """
+
+    PYTHON = "python"
+    """Python programming language."""
+    TRITON = "triton"
+    """Triton GPU programming language."""
+    CPP = "cpp"
+    """Pure C++ source code."""
+    CUDA = "cuda"
+    """CUDA C++ programming language."""
+    TILELANG = "tilelang"
+    """TileLang GPU programming language."""
+
+
+class SupportedBindings(str, Enum):
+    """Supported bindings for C++/CUDA solution implementations.
+
+    Enumeration of binding types that can be used to interface compiled
+    C++/CUDA code with Python.
+    """
+
+    TVM_FFI = "tvm-ffi"
+    """TVM-FFI binding for framework-agnostic DLPack interop. Preferred for C++/CUDA solutions."""
+    TORCH = "torch"
+    """PyTorch C++/CUDA extension binding."""
+
+
+class SourceFile(BaseModelWithDocstrings):
+    """A single source code file in a solution implementation.
+
+    Represents a source code file with its relative path and complete content.
+    The file content is validated for syntax correctness based on the file extension.
+    """
+
+    path: NonEmptyString
+    """The relative path of the file, including its name and extension (e.g., 'src/kernel.cu',
+    'main.py'). When compiling the solution, a temporary solution source directory will be
+    created, and the file will be placed according to this path. The path should not contain
+    parent directory traversal ("..")."""
+    content: NonEmptyString
+    """The complete text content of the source file."""
+
+    @model_validator(mode="after")
+    def _validate_source_path(self) -> "SourceFile":
+        """Validate source path for security.
+
+        Raises
+        ------
+        ValueError
+            If the path contains security issues (absolute paths or path traversal).
+        """
+        src_path = Path(self.path)
+        if src_path.is_absolute():
+            raise ValueError(f"Invalid source path (absolute path not allowed): {self.path}")
+        if ".." in src_path.parts:
+            raise ValueError(
+                f"Invalid source path (parent directory traversal not allowed): {self.path}"
+            )
+        return self
+
+
+class BuildSpec(BaseModelWithDocstrings):
+    """Build specification for a solution implementation.
+
+    Contains all technical specifications required to build and execute a solution, including
+    language, hardware targets, dependencies, entry point, and build commands.
+    """
+
+    language: SupportedLanguages
+    """The primary programming language (e.g., 'triton', 'cuda', 'python')."""
+    target_hardware: List[str] = Field(min_length=1)
+    """List of hardware this solution is compatible with. E.g. 'cpu', 'cuda'. Note this is not used
+    in verification and building now."""
+    entry_point: NonEmptyString
+    """The exact path to the function to be called. Format: '{file_path}::{function_name}'
+    (e.g., 'main.py::run')."""
+    dependencies: List[NonEmptyString] = Field(default_factory=list)
+    """Optional list of required libraries or packages. E.g. for CUDA, we support 'cublas',
+    'cudnn', 'cutlass'"""
+    destination_passing_style: bool = True
+    """Whether to use destination passing style for the solution. If True, the solution should
+    accept the output tensors as the last arguments. If False, the solution should return the
+    output tensors."""
+    binding: Optional[SupportedBindings] = None
+    """The binding type to use for C++/CUDA solutions. If None, defaults to 'tvm-ffi' for
+    C++/CUDA languages. Ignored for Python and Triton languages."""
+
+    @model_validator(mode="after")
+    def _validate_entry_point(self) -> "BuildSpec":
+        """Validate entry_point format.
+
+        Raises
+        ------
+        ValueError
+            If entry_point doesn't follow the required format.
+        """
+        if self.entry_point.count("::") != 1:
+            raise ValueError(
+                f"Invalid entry point format: {self.entry_point}. Expected "
+                '"<file_path>::<function_name>".'
+            )
+        return self
+
+
+class Solution(BaseModelWithDocstrings):
+    """A concrete implementation for a given Definition.
+
+    Represents a complete solution that provides a high-performance implementation
+    for a computational workload defined by a Definition. Contains all source code,
+    build specifications, and metadata required for building, interfacing, and
+    benchmarking the implementation.
+    """
+
+    model_config = ConfigDict(use_attribute_docstrings=True, frozen=True)
+    """Treat Solution as immutable to safely memoize derived fields."""
+
+    _hash_cache: str = PrivateAttr()
+    """Memoized hash of the solution content."""
+
+    name: NonEmptyString
+    """A unique, human-readable name for this specific solution (e.g., 'rmsnorm_triton_v1_h100')."""
+    definition: NonEmptyString
+    """The name of the Definition this implementation solves."""
+    author: NonEmptyString
+    """The name of the author or agent system that created this solution."""
+    spec: BuildSpec
+    """Technical specifications for building and executing this solution."""
+    sources: List[SourceFile] = Field(min_length=1)
+    """Array of source code files representing the complete implementation."""
+    description: Optional[str] = Field(default=None)
+    """Optional human-readable description of the solution's technique or approach."""
+
+    @model_validator(mode="after")
+    def _validate_source_path_entry_point(self) -> "Solution":
+        """Validate source file paths for uniqueness and entry file existence.
+
+        Raises
+        ------
+        ValueError
+            If duplicate source file paths are found or the entry file is not found in the sources.
+        """
+        seen_paths = set()
+        for source in self.sources:
+            # Check for duplicates
+            if source.path in seen_paths:
+                raise ValueError(f"Duplicate source path '{source.path}'")
+            seen_paths.add(source.path)
+
+        entry_file = self.spec.entry_point.split("::")[0]
+
+        if entry_file not in seen_paths:
+            raise ValueError(f"Entry source file '{entry_file}' not found in sources")
+
+        return self
+
+    def get_entry_path(self) -> Path:
+        """Extract the file path from the entry point specification.
+
+        The entry point format is '{file_path}::{function_name}', and this method
+        returns the file path component as a Path object.
+
+        Returns
+        -------
+        Path
+            The relative path to the entry source file (e.g., 'main.py', 'src/kernel.cu').
+        """
+        return Path(self.spec.entry_point.split("::")[0])
+
+    def get_entry_symbol(self) -> str:
+        """Extract the function/symbol name from the entry point specification.
+
+        The entry point format is '{file_path}::{function_name}', and this method
+        returns the function name component. This is the symbol that builders will
+        look up in the compiled module or imported Python module.
+
+        Returns
+        -------
+        str
+            The function or symbol name to be loaded (e.g., 'run', 'forward', 'kernel').
+        """
+        return self.spec.entry_point.split("::")[-1]
+
+    def get_entry_source(self) -> Optional[SourceFile]:
+        """Get the entry source file specified in the build spec.
+
+        Returns
+        -------
+        Optional[SourceFile]
+            The SourceFile object containing the entry point, or None if not found.
+        """
+        entry_path = self.spec.entry_point.split("::")[0]
+        for source in self.sources:
+            if source.path == entry_path:
+                return source
+        return None
+
+    def model_post_init(self, __context: Any) -> None:
+        # Precompute hash once since the model is frozen/immutable.
+        object.__setattr__(self, "_hash_cache", self._compute_hash())
+
+    def _compute_hash(self) -> str:
+        """Compute a deterministic hash of the solution content (excluding name)."""
+        h = hashlib.sha1()
+        for s in (
+            self.definition,
+            self.spec.language,
+            self.spec.entry_point,
+            self.spec.binding.value if self.spec.binding else "",
+            *self.spec.dependencies,
+            *(part for src in self.sources for part in (src.path, src.content)),
+        ):
+            h.update(s.encode())
+
+        return h.hexdigest()
+
+    def with_unique_name(self) -> "Solution":
+        """Return a copy with name suffixed by content hash for uniqueness.
+
+        The generated name is deterministic: same code always produces the
+        same unique name regardless of submission order or environment.
+
+        Returns
+        -------
+        Solution
+            A new Solution instance with name ``{name}_{hash[:8]}``.
+        """
+        unique_name = f"{self.name}_{self.hash()[:8]}"
+        data = self.model_dump()
+        data["name"] = unique_name
+        return Solution(**data)
+
+    def hash(self) -> str:
+        """Return the memoized deterministic hash of the solution content (excluding name).
+
+        This hash is computed from all fields that affect the solution's behavior:
+        definition, language, entry point, dependencies, and all source file
+        paths and contents. This ensures that any meaningful change to the solution
+        results in a different hash.
+
+        The hash is used for caching build artifacts, allowing solutions with the same
+        hash to reuse the same cached build result.
+
+        Returns
+        -------
+        str
+            A SHA1 hash (40 hex characters) uniquely identifying this solution's content.
+        """
+        return self._hash_cache
+
+    def __hash__(self) -> int:  # pragma: no cover - trivial wrapper
+        # Use the memoized content hash for fast hashing in dict/set keys.
+        return hash(self._hash_cache)
+
+    def __eq__(self, other: object) -> bool:  # pragma: no cover - trivial wrapper
+        if not isinstance(other, Solution):
+            return NotImplemented
+        return self._hash_cache == other._hash_cache
+
+
+# ===== flashinfer_bench/data/trace.py =====
+"""Strong-typed data definitions for traces and evaluations."""
+
+import math
+from enum import Enum
+from typing import Any, Dict, Optional
+
+from pydantic import ConfigDict, Field, field_validator, model_validator
+
+from .utils import BaseModelWithDocstrings, NonEmptyString
+from .workload import Workload
+
+
+class Correctness(BaseModelWithDocstrings):
+    """Correctness metrics from numerical evaluation.
+
+    Contains error measurements comparing the solution output against
+    a reference implementation to assess numerical accuracy.
+    """
+
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
+    max_relative_error: float = Field(default=0.0)
+    """Maximum relative error observed across all output elements."""
+    max_absolute_error: float = Field(default=0.0)
+    """Maximum absolute error observed across all output elements."""
+    extra: Optional[Dict[str, Any]] = Field(default=None)
+    """Extra metrics for correctness evaluation."""
+
+    @field_validator("max_relative_error", "max_absolute_error")
+    @classmethod
+    def non_negative_or_nan(cls, v: float):
+        if math.isnan(v):
+            return v
+        if v < 0:
+            raise ValueError("must be non-negative or NaN")
+        return v
+
+
+class Performance(BaseModelWithDocstrings):
+    """Performance metrics from timing evaluation.
+
+    Contains timing measurements and performance comparisons from
+    benchmarking the solution against reference implementations.
+    """
+
+    latency_ms: float = Field(default=0.0, ge=0.0)
+    """Solution execution latency in milliseconds."""
+    reference_latency_ms: float = Field(default=0.0, ge=0.0)
+    """Reference implementation latency in milliseconds for comparison."""
+    speedup_factor: float = Field(default=0.0, ge=0.0)
+    """Performance speedup factor compared to reference (reference_time / solution_time)."""
+
+
+class Environment(BaseModelWithDocstrings):
+    """Environment information from evaluation execution.
+
+    Records the hardware and software environment details from when
+    the evaluation was performed, enabling reproducibility analysis.
+    """
+
+    hardware: NonEmptyString
+    """Hardware identifier where the evaluation was performed (e.g., 'NVIDIA_H100')."""
+    libs: Dict[str, str] = Field(default_factory=dict)
+    """Dictionary of library names to version strings used during evaluation."""
+
+
+class EvaluationStatus(str, Enum):
+    """Status codes for evaluation results.
+
+    Enumeration of all possible outcomes when evaluating a solution
+    against a workload, covering success and various failure modes.
+    """
+
+    PASSED = "PASSED"
+    """Evaluation completed successfully with correct results."""
+    INCORRECT_SHAPE = "INCORRECT_SHAPE"
+    """Solution produced output with incorrect tensor shape."""
+    INCORRECT_NUMERICAL = "INCORRECT_NUMERICAL"
+    """Solution produced numerically incorrect results."""
+    INCORRECT_DTYPE = "INCORRECT_DTYPE"
+    """Solution produced output with incorrect data type."""
+    RUNTIME_ERROR = "RUNTIME_ERROR"
+    """Solution encountered a runtime error during execution."""
+    COMPILE_ERROR = "COMPILE_ERROR"
+    """Solution failed to compile or build successfully."""
+    TIMEOUT = "TIMEOUT"
+    """Evaluation did not complete within the configured timeout."""
+
+
+class Evaluation(BaseModelWithDocstrings):
+    """Complete evaluation result for a solution on a workload.
+
+    Records the full outcome of benchmarking a solution implementation
+    against a specific workload, including status, metrics, and environment.
+    """
+
+    status: EvaluationStatus
+    """The overall evaluation status indicating success or failure mode."""
+    environment: Environment
+    """Environment details where the evaluation was performed."""
+    timestamp: NonEmptyString
+    """Timestamp when the evaluation was performed (ISO format recommended)."""
+    log: str = ""
+    """Captured stdout/stderr from the evaluation run."""
+    correctness: Optional[Correctness] = None
+    """Correctness metrics (present for PASSED and INCORRECT_NUMERICAL status)."""
+    performance: Optional[Performance] = None
+    """Performance metrics (present only for PASSED status)."""
+
+    @model_validator(mode="after")
+    def _validate_status_correctness_performance(self) -> "Evaluation":
+        """Validate correctness and performance fields based on status.
+
+        Ensures that correctness and performance metrics are present or absent
+        based on the evaluation status, following the schema requirements.
+
+        Raises
+        ------
+        ValueError
+            If correctness/performance presence doesn't match status requirements.
+        """
+        if self.status == EvaluationStatus.PASSED:
+            if self.correctness is None:
+                raise ValueError(
+                    f"Evaluation must include correctness when status is {self.status}"
+                )
+            if self.performance is None:
+                raise ValueError(
+                    f"Evaluation must include performance when status is {self.status}"
+                )
+        elif self.status == EvaluationStatus.INCORRECT_NUMERICAL:
+            if self.correctness is None:
+                raise ValueError(
+                    f"Evaluation must include correctness when status is {self.status}"
+                )
+            if self.performance is not None:
+                raise ValueError(
+                    f"Evaluation must not include performance when status is {self.status}"
+                )
+        else:
+            # For other error statuses, neither correctness nor performance should be present
+            if self.correctness is not None:
+                raise ValueError(
+                    f"Evaluation must not include correctness when status is {self.status}"
+                )
+            if self.performance is not None:
+                raise ValueError(
+                    f"Evaluation must not include performance when status is {self.status}"
+                )
+        return self
+
+
+class Trace(BaseModelWithDocstrings):
+    """Complete trace linking a solution to a definition with evaluation results.
+
+    A Trace represents the complete record of benchmarking a specific solution
+    implementation against a specific computational workload definition. It includes
+    the workload configuration and evaluation results.
+
+    Special case: A "workload trace" contains only definition and workload fields
+    (with solution and evaluation set to None), representing a workload configuration
+    without an actual benchmark execution.
+    """
+
+    definition: NonEmptyString
+    """Name of the Definition that specifies the computational workload."""
+    workload: Workload
+    """Concrete workload configuration with specific axis values and inputs."""
+    solution: Optional[str] = None
+    """Name of the Solution implementation (None for workload-only traces)."""
+    evaluation: Optional[Evaluation] = None
+    """Evaluation results from benchmarking (None for workload-only traces)."""
+
+    def is_workload_trace(self) -> bool:
+        """Check if this is a workload-only trace.
+
+        Returns
+        -------
+        bool
+            True if this is a workload trace without solution/evaluation data.
+        """
+        return self.solution is None and self.evaluation is None
+
+    def is_successful(self) -> bool:
+        """Check if the benchmark execution was successful.
+
+        Returns
+        -------
+        bool
+            True if this is a regular trace with successful evaluation status.
+            False for workload traces or failed evaluations.
+        """
+        return (not self.is_workload_trace()) and self.evaluation.status == EvaluationStatus.PASSED
+
+
+# ===== flashinfer_bench/bench/config.py =====
+"""Configuration for benchmark execution."""
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+from pydantic import BaseModel, Field, model_validator
+
+
+class EvalConfig(BaseModel):
+    """Per-definition eval parameters. All fields Optional; None means inherit from parent layer."""
+
+    warmup_runs: Optional[int] = Field(default=None, ge=0)
+    """Warmup iterations before timing. `None` means inherit."""
+    iterations: Optional[int] = Field(default=None, gt=0)
+    """Timed iterations per trial. `None` means inherit."""
+    num_trials: Optional[int] = Field(default=None, gt=0)
+    """Number of benchmark trials. `None` means inherit."""
+    rtol: Optional[float] = Field(default=None, gt=0)
+    """Relative tolerance for numerical checks. `None` means inherit."""
+    atol: Optional[float] = Field(default=None, gt=0)
+    """Absolute tolerance for numerical checks. `None` means inherit."""
+    required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
+    """Minimum fraction of elements that must be within tolerance. `None` means inherit."""
+    extra: Dict[str, Any] = Field(default_factory=dict)
+    """Evaluator-specific parameters that do not belong in the shared schema."""
+
+
+class ResolvedEvalConfig(BaseModel):
+    """Resolved eval parameters with all fields populated. This is what evaluators consume."""
+
+    warmup_runs: int = 10
+    """Warmup iterations before timing."""
+    iterations: int = 50
+    """Timed iterations per trial."""
+    num_trials: int = 3
+    """Number of benchmark trials."""
+    rtol: float = 1e-2
+    """Relative tolerance for numerical checks."""
+    atol: float = 1e-2
+    """Absolute tolerance for numerical checks."""
+    required_matched_ratio: Optional[float] = None
+    """Minimum fraction of elements that must be within tolerance."""
+    profile_baseline: bool = True
+    """Whether to profile the reference implementation for baseline latency."""
+    extra: Dict[str, Any] = Field(default_factory=dict)
+    """Evaluator-specific parameters after all config layers have been merged."""
+
+
+class BenchmarkConfig(BaseModel):
+    """Configuration for benchmark runs. Mirrors the YAML structure exactly.
+
+    All fields have default values to make configuration optional.
+    """
+
+    # System-level
+    use_isolated_runner: bool = False
+    """Whether to use the isolated runner instead of the persistent runner."""
+    definitions: Optional[List[str]] = None
+    """Optional allowlist of definition names to benchmark."""
+    solutions: Optional[List[str]] = None
+    """Optional allowlist of solution names to benchmark."""
+    timeout_seconds: int = Field(default=300, gt=0)
+    """Timeout in seconds for each solution evaluation."""
+    profile_baseline: bool = True
+    """Whether to profile the reference implementation for baseline latency."""
+    log_dir: Optional[str] = None
+    """Deprecated. Logs are embedded in trace evaluations."""
+
+    # Top-level / CLI overrides. None means "not set at this layer" — falls through
+    # to YAML layers and the hardcoded defaults in ResolvedEvalConfig. When non-None,
+    # these win over op_type_config and definition_config (CLI has highest priority).
+    warmup_runs: Optional[int] = Field(default=None, ge=0)
+    """CLI override for warmup iterations. None means inherit from YAML / defaults."""
+    iterations: Optional[int] = Field(default=None, gt=0)
+    """CLI override for timed iterations per trial. None means inherit from YAML / defaults."""
+    num_trials: Optional[int] = Field(default=None, gt=0)
+    """CLI override for number of benchmark trials. None means inherit from YAML / defaults."""
+    rtol: Optional[float] = Field(default=None, gt=0)
+    """CLI override for relative tolerance. None means inherit from YAML / defaults."""
+    atol: Optional[float] = Field(default=None, gt=0)
+    """CLI override for absolute tolerance. None means inherit from YAML / defaults."""
+    required_matched_ratio: Optional[float] = Field(default=None, gt=0, le=1)
+    """CLI override for required matched ratio. None means inherit from YAML / defaults."""
+    # Deprecated: use op_type_config/definition_config extra instead. Kept as
+    # top-level CLI-style overrides for the same reason as the other eval fields:
+    # None means "not set at this layer"; non-None wins over YAML layer.extra.
+    sampling_validation_trials: Optional[int] = Field(default=None, gt=0)
+    """Deprecated CLI override for Sampling evaluator validation rounds."""
+    sampling_tvd_threshold: Optional[float] = Field(default=None, ge=0, le=1)
+    """Deprecated CLI override for Sampling evaluator TVD threshold."""
+
+    # Per op_type / per definition overrides
+    op_type_config: Dict[str, EvalConfig] = Field(default_factory=dict)
+    """Per-op-type eval overrides keyed by `definition.op_type`."""
+    definition_config: Dict[str, EvalConfig] = Field(default_factory=dict)
+    """Per-definition eval overrides keyed by `definition.name`."""
+
+    @model_validator(mode="after")
+    def _validate_fields(self) -> BenchmarkConfig:
+        if self.log_dir is not None:
+            warnings.warn(
+                "log_dir is deprecated and ignored; logs are embedded in trace evaluations",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return self
+
+    @classmethod
+    def from_yaml(cls, path: str, **overrides: Any) -> BenchmarkConfig:
+        """Load config from a YAML file, with optional field overrides."""
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        data.update(overrides)
+        return cls.model_validate(data)
+
+    @classmethod
+    def default(cls, **overrides: Any) -> BenchmarkConfig:
+        """Load the bundled eval_config.yaml if it exists, otherwise use defaults."""
+        yaml_path = Path(__file__).parent / "eval_config.yaml"
+        if yaml_path.exists():
+            return cls.from_yaml(str(yaml_path), **overrides)
+        return cls(**overrides)
+
+    def resolve_eval_config(self, definition: Any) -> ResolvedEvalConfig:
+        """Merge priority (lowest -> highest): ResolvedEvalConfig defaults ->
+        op_type_config -> definition_config -> top-level / CLI overrides.
+
+        Top-level fields win when non-None, so a CLI flag such as
+        ``--required-matched-ratio 0.9`` is never silently shadowed by a value
+        coming from the packaged ``eval_config.yaml``.
+        """
+        merged: Dict[str, Any] = {"profile_baseline": self.profile_baseline, "extra": {}}
+
+        layers = [
+            self.op_type_config.get(definition.op_type),
+            self.definition_config.get(definition.name),
+        ]
+        for layer in layers:
+            if layer is None:
+                continue
+            updates = {
+                k: v for k, v in layer.model_dump(exclude={"extra"}).items() if v is not None
+            }
+            merged.update(updates)
+            if layer.extra:
+                merged["extra"].update(layer.extra)
+
+        top_level = {
+            "warmup_runs": self.warmup_runs,
+            "iterations": self.iterations,
+            "num_trials": self.num_trials,
+            "rtol": self.rtol,
+            "atol": self.atol,
+            "required_matched_ratio": self.required_matched_ratio,
+        }
+        merged.update({k: v for k, v in top_level.items() if v is not None})
+
+        extra_overrides = {
+            "sampling_validation_trials": self.sampling_validation_trials,
+            "sampling_tvd_threshold": self.sampling_tvd_threshold,
+        }
+        merged["extra"].update({k: v for k, v in extra_overrides.items() if v is not None})
+
+        return ResolvedEvalConfig(**merged)
+
+
+# ===== flashinfer_bench/compile/builder.py =====
+"""Abstract base class for solution builders."""
+
+from __future__ import annotations
+
+import inspect
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Callable, Tuple
+
+from flashinfer_bench.data import Definition, Solution
+from flashinfer_bench.env import get_fib_cache_path
+
+from .runnable import Runnable
+from .utils import create_package_name
+
+
+class BuildError(RuntimeError):
+    """Raised when a builder fails to construct a runnable implementation."""
+
+
+class Builder(ABC):
+    """Abstract base class for building solutions into runnable implementations.
+
+    A Builder transforms a (Definition, Solution) pair into a Runnable object, which is an
+    executable implementation of the solution. Different builders handle different programming
+    languages (e.g., Python, CUDA, Triton) and build systems.
+
+    Subclasses must implement all its abstract methods. Expectedly, the concrete builder should
+    operate in the folder `FIB_CACHE_PATH / builder_specific_subfolder / package_name`, where
+    `package_name` is a unique name created from the solution.
+    """
+
+    _package_prefix: str
+    """The prefix to prepend to the package name."""
+
+    _build_dir_name: str
+    """The name of the build subdirectory of the concrete builder."""
+
+    def __init__(self, package_prefix: str, build_dir_name: str) -> None:
+        """Initialize the builder.
+
+        Parameters
+        ----------
+        package_prefix : str
+            The prefix to prepend to the package name. This should be unique for each builder type.
+        build_dir_name : str
+            The name of the build subdirectory of the concrete builder. This should be
+            unique for each builder type.
+        """
+        self._package_prefix = package_prefix
+        self._build_dir_name = build_dir_name
+
+    @staticmethod
+    @abstractmethod
+    def is_available() -> bool:
+        """Check if this builder is available in the current environment.
+
+        Override this method in subclasses to check for specific dependencies
+        (e.g., CUDA, Triton, TVM). The default implementation returns True.
+
+        Returns
+        -------
+        bool
+            True if the builder can be used, False otherwise.
+        """
+        ...
+
+    @abstractmethod
+    def can_build(self, solution: Solution) -> bool:
+        """Check if this builder can handle the given solution.
+
+        Parameters
+        ----------
+        solution : Solution
+            The solution to check.
+
+        Returns
+        -------
+        bool
+            True if this builder can build the solution, False otherwise.
+        """
+        ...
+
+    @abstractmethod
+    def build(self, definition: Definition, solution: Solution) -> Runnable:
+        """Build a solution into a runnable implementation.
+
+        This method compiles/loads the solution's source code and returns a Runnable
+        object that can be executed with the interface specified by the definition.
+
+        Parameters
+        ----------
+        definition : Definition
+            The problem definition that specifies the expected interface.
+        solution : Solution
+            The solution implementation to build.
+
+        Returns
+        -------
+        Runnable
+            An executable wrapper around the built implementation.
+
+        Raises
+        ------
+        BuildError
+            If the build fails for any reason (compilation errors, missing dependencies, etc.).
+        """
+        ...
+
+    def _get_package_name_and_build_path(self, solution: Solution) -> Tuple[str, Path]:
+        """Get the package name and build path for the solution. The package name is a unique
+        identifier for the solution with only alphanumeric characters and underscores. The
+        build path is FIB_CACHE_PATH / build_dir_name / package_name.
+
+        Parameters
+        ----------
+        solution : Solution
+            The solution to get the package name and build path for.
+
+        Returns
+        -------
+        Tuple[str, Path]
+            The package name and build path for the solution.
+        """
+        package_name = create_package_name(solution, self._package_prefix)
+        build_path = get_fib_cache_path() / self._build_dir_name / package_name
+        return package_name, build_path
+
+    def _try_validate_signature(
+        self, callable: Callable, definition: Definition, solution: Solution
+    ) -> None:
+        """Try to validate the signature of the callable. It only checks the number of
+        parameters and the return type. If the signature is unavailable, it will skip all checks.
+
+        Parameters
+        ----------
+        callable : Callable
+            The callable to validate.
+        definition : Definition
+            The definition to validate against.
+        solution : Solution
+            The solution to validate against.
+
+        Raises
+        ------
+        BuildError
+            If the signature can be checked and is invalid.
+        """
+
+        # Analyze the signature of the callable (skip all checks if signature unavailable)
+        try:
+            signature = inspect.signature(callable)
+        except (ValueError, TypeError):
+            return
+
+        dps = solution.spec.destination_passing_style
+        expected_nparam = (
+            len(definition.inputs) + len(definition.outputs) if dps else len(definition.inputs)
+        )
+
+        # Validate against the actual call shape used by benchmark/apply runtime: a fixed number
+        # of positional arguments derived from the definition. This accepts extra optional
+        # parameters with defaults while still rejecting missing required or keyword-only
+        # parameters that cannot be satisfied by positional calling.
+        sample_args = [object() for _ in range(expected_nparam)]
+        try:
+            signature.bind(*sample_args)
+        except TypeError as e:
+            style = "Destination-passing" if dps else "Value-returning"
+            raise BuildError(
+                f"{style} style callable: expected {expected_nparam} positional parameters, "
+                f"but signature '{signature}' is incompatible: {e}"
+            ) from e
+
+        # Check return annotation (only for value-returning style)
+        if not solution.spec.destination_passing_style:
+            num_outputs = len(definition.outputs)
+            ret_ann = signature.return_annotation
+            if ret_ann is not inspect.Signature.empty:
+                origin = getattr(ret_ann, "__origin__", None)
+                if origin is tuple:
+                    # If returning tuple, length must match num_outputs
+                    args = getattr(ret_ann, "__args__", None)
+                    if args is not None and len(args) != num_outputs:
+                        raise BuildError(
+                            f"Value-returning style callable with {num_outputs} outputs must "
+                            f"return a {num_outputs}-element tuple, got {ret_ann}"
+                        )
+                elif ret_ann is None:
+                    # If return None, num_outputs must be 0
+                    if num_outputs != 0:
+                        raise BuildError(
+                            f"Value-returning style callable with {num_outputs} outputs must "
+                            f"not return None"
+                        )
+                elif num_outputs != 1:
+                    # If returning non-tuple, num_outputs must be 1
+                    raise BuildError(
+                        f"Value-returning style callable returning non-tuple must "
+                        f"only have one output, got {num_outputs}"
+                    )
+
+
+# ===== docs/flashinfer-trace/definition.mdx =====
+---
+title: "Definition"
+---
+
+## Overview
+
+This document describes the JSON schema for a kernel **Definition**.
+
+The `Definition` provides a formal, machine-readable specification for a computational workload found in a model's forward pass. It is designed to be the single source of truth that guides both human and agent-based kernel development. Specifically, this schema defines:
+
+1. **Tensor Formats**: The shape, data type (`dtype`).
+2. **Dimension Semantics**: The distinction between `constant` dimensions (fixed at compile time) and `variable` dimensions (determined at runtime).
+3. **Computational Logic**: A clear, step-by-step **reference implementation** in plain PyTorch, which serves as the official mathematical specification of the kernel.
+
+Note that a `Definition` does not contain specific input *data* for its variable axes. That data is provided by the `workload` field of each `Trace`, which is used for benchmarking `Solution` s.
+
+## JSON Schema Description
+
+### Top-Level Object Structure
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | Yes | A unique, human-readable name for the kernel, should include concrete problem information. Naming convention: `{op_type}_{props}_{constants}` (e.g. `gqa_paged_decode_h32_kv8_d128_ps1`). |
+| `op_type` | string | Yes | The general compute category. |
+| `tags` | array[string] (Default: `null`) | No | The string tags associated with this definition. Used for grouping and filtering. |
+| `description` | string (Default: `null`) | No | A brief, human-readable description of the definition and its purpose. |
+| `axes` | Dict[string, Union[AxisConst, AxisVar]] | Yes | An object mapping symbolic dimension names (e.g., `"M"`, `"N"`, `"K"`) to their definitions. The value is either a constant or a variable axis. The axes will be bound to the input tensor dimensions at runtime. |
+| `inputs` | Dict[string, TensorSpec] | Yes | Named input tensors (e.g.,`"A"`,`"B"`). |
+| `outputs` | Dict[string, TensorSpec] | Yes | Named output tensors (e.g.,`"C"`). |
+| `reference` | string | Yes | The reference implementation in PyTorch, serving as the mathematical specification. |
+| `constraints` | array[string] (Default: `null`) | No | An optional list of assertions describing relationships between axes. |
+
+### `op_type`: Compute Category
+
+`op_type` is a `string` field used for grouping and filtering kernels. It represents the general compute characteristic.
+
+Current supported `op_type`s are:
+
+- Attention: `gqa_ragged`, `gqa_paged`, `mla_ragged`, `mla_paged`
+- GEMM: `gemm`
+- Misc: `rmsnorm`, `fused_add_rmsnorm`
+
+### `tags` : Additional Attributes
+
+`tags` is an array of strings that attaches searchable attributes to a definition. Tags use **namespaced keys** to keep meanings clear and filterable.
+
+Each tag is either:
+
+- a namespaced key–value string: `"<namespace>:<value>"`, or
+- a flag without a value (e.g., `"fused"`).
+
+Controlled namespaces:
+
+- `stage: *` — Which computation stage this definition fits to.
+
+    Examples: `stage: prefill`, `stage: decode`.
+
+- `model:*` — Models known to use this definition (ideally **system-derived** from references/traces).
+
+    Examples: `model:llama-3.1-8b`, `model:deepseek-v3`.
+
+- `quantization:*` — Indicates quantization characteristics. For the simple case, encode the effective dtype.
+
+    Examples: `quantization:float8_e4m3fn`, `quantization:int8`.
+
+- `status:*` — Community/validation status.
+
+    Examples: `status:verified`, `status:draft`, `status:deprecated`.
+
+- `fused` — Flag tag indicating the definition represents a fused kernel.
+
+### `axes` : Dimension Definitions
+
+The `axes` object contains any number of keys, where each key is a symbolic dimension name (e.g., `"M"`, `"N"`, `"K"`), and the value is an object describing its type.
+
+### `type`: `const`
+
+Represents a constant dimension.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `type` | string | Yes | Must be `"const"` |
+| `value` | integer | Yes | Constant value of the axis |
+| `description` | string | No | Brief description. |
+
+Example:
+
+```json
+"hidden_size": {
+  "type": "const",
+  "value": 4096
+}
+
+```
+
+### `type`: `var`
+
+Represents a variable axis whose value will be determined by the input data.
+
+| Field | Type | Required | Description | Default |
+| --- | --- | --- | --- | --- |
+| `type` | string | Yes | Must be `"var"` | — |
+| `description` | string | No | Brief description |  |
+
+Example:
+
+```json
+"sequence_length": {
+  "type": "var",
+}
+
+```
+
+### `inputs`, `outputs` : Tensor Definitions
+
+These fields describe the input and output tensors of the kernel. They contain any number of key-value pairs, where each key is the name of a tensor (e.g., `"A"`, `"B"`, `"C"`). The value is a tensor description:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `shape` | array or `null` | Yes | List of axis names (strings). Represents a scalar if `null`. |
+| `dtype` | string | Yes | Data type of the tensor |
+| `description` | string | No | Brief description. |
+
+### `dtype` : Data Types
+
+The following values are allowed for `dtype`:
+
+- `float32`
+- `float16`
+- `bfloat16`
+- `float8_e4m3fn`
+- `float8_e5m2`
+- `float4_e2m1`
+- `int64`
+- `int32`
+- `int16`
+- `int8`
+- `bool`
+
+### Scalar Values and 0-D Tensors
+Specifically, a tensor with a shape `[]` (empty array) represents a 0-D tensor.
+
+To represent a scalar value, we use shape `null`. The scalar input must receive a python scalar data (int, float, bool). The scalar output will return a python scalar value.
+
+Example:
+
+```json
+"inputs": {
+  "logits": {
+    "shape": ["batch_size", "vocab_size"],
+    "dtype": "float16"
+  },
+  "temperature": {
+    "shape": null,
+    "dtype": "float16"
+  }
+},
+"outputs": {
+  "probs": {
+    "shape": ["batch_size", "vocab_size"],
+    "dtype": "float16"
+  }
+}
+
+```
+
+### `reference` : Reference Implementation
+
+The `reference` field is a string that contains the reference implementation of the kernel in plain PyTorch.
+
+- It must contain a global function named `run` as the entry point.
+- This code defines the **official mathematical specification** of the kernel.
+- It should avoid high-level packagings (e.g., **`torch.nn.functional`**) in favor of explicit, step-by-step computations to ensure maximum clarity for all consumers (human or agent).
+
+## Examples
+
+### Example 1: Standard GEMM
+
+```json
+{
+  "name": "gemm_n_4096_k_4096",
+  "description": "General matrix multiply (GEMM) C = A @ B.T.",
+  "op_type": "gemm",
+  "tags": [
+    "status:verified",
+    "model:llama-3.1-8b"
+  ],
+  "axes": {
+    "M": { "type": "var" },
+    "N": { "type": "const", "value": 4096 },
+    "K": { "type": "const", "value": 4096 }
+  },
+  "inputs": {
+    "A": { "shape": ["M", "K"], "dtype": "float16" },
+    "B": { "shape": ["N", "K"], "dtype": "float16" }
+  },
+  "outputs": {
+    "C": { "shape": ["M", "N"], "dtype": "float16" }
+  },
+  "reference": "import torch\n\ndef run(A, B):\n    C = torch.matmul(A, B.T)\n    return C"
+}
+
+```
+
+### Example 2: Quantized GEMM
+
+```json
+{
+  "name": "quantized_gemm_n4096_k4096_ng128_kg128",
+  "description": "A GEMM operation with per-tensor quantized inputs and per-group scaling factors.",
+  "op_type": "gemm",
+  "tags": [
+      "status:draft",
+      "model:some_model",
+    "quantization:float8_e4m3fn"
+    ]
+  "axes": {
+    "M": { "type": "var" },
+    "N": { "type": "const", "value": 4096 },
+    "K": { "type": "const", "value": 4096 },
+    "N_group": { "type": "const", "value": 128 },
+    "K_group": { "type": "const", "value": 128 }
+  },
+  "inputs": {
+    "A": {
+      "shape": ["M", "K"],
+      "dtype": "float8_e4m3fn"
+    },
+    "B": {
+      "shape": ["N", "K"],
+      "dtype": "float8_e4m3fn"
+    },
+    "A_scale": {
+      "shape": ["M", "K_group"],
+      "dtype": "float32"
+    },
+    "B_scale": {
+      "shape": ["N_group", "K_group"],
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "C": {
+      "shape": ["M", "N"],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "..."
+}
+```
+
+### Example 3: Grouped GEMM
+
+```json
+{
+  "name": "grouped_gemm_n4096_k4096",
+  "description": "A batch of independent GEMM operations, grouped along a 'G' dimension.",
+  "op_type": "grouped_gemm",
+  "tags": [
+    "status:draft",
+    "model:some_model"
+  ]
+  "axes": {
+    "G": { "type": "var" },
+    "M": { "type": "var" },
+    "N": { "type": "const", "value": 4096 },
+    "K": { "type": "const", "value": 4096 }
+  },
+  "inputs": {
+    "A": {
+      "shape": ["G", "M", "K"],
+      "dtype": "float16"
+    },
+    "B": {
+      "shape": ["G", "K", "N"],
+      "dtype": "float16"
+    }
+  },
+  "outputs": {
+    "C": {
+      "shape": ["G", "M", "N"],
+      "dtype": "float16"
+    }
+  },
+  "reference": "...",
+}
+```
+
+### Example 4: Quantized Grouped GEMM
+
+```json
+{
+  "name": "quantized_grouped_gemm_n4096_k4096_kg128",
+  "description": "A batched GEMM operation where the inputs are quantized, with per-group scaling factors.",
+  "op_type": "grouped_gemm",
+  "tags": [
+    "status:draft",
+    "quantization:float8_e4m3fn",
+    "model:some_model"
+  ]
+  "axes": {
+    "G": { "type": "var" },
+    "M": { "type": "var" },
+    "N": { "type": "const", "value": 4096 },
+    "K": { "type": "const", "value": 4096 },
+    "K_group": { "type": "const", "value": 128 }
+  },
+  "inputs": {
+    "A": {
+      "shape": ["G", "M", "K"],
+      "dtype": "float8_e4m3fn"
+    },
+    "B": {
+      "shape": ["G", "K", "N"],
+      "dtype": "float8_e4m3fn"
+    },
+    "A_scale": {
+      "shape": ["G", "M", "K_group"],
+      "dtype": "float32"
+    },
+    "B_scale": {
+      "shape": ["G", "K_group", "N"],
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "C": {
+      "shape": ["G", "M", "N"],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "..."
+}
+```
+
+### Example 5: RMSNorm
+
+```json
+{
+  "name": "rmsnorm_d4096",
+  "description": "Root Mean Square Normalization, a common layer normalization variant.",
+  "type": "norm",
+  "tags": [
+    "status:draft",
+    "model:some_model"
+  ],
+  "axes": {
+    "batch_size": { "type": "var" },
+    "hidden_size": { "type": "const", "value": 4096 }
+  },
+  "inputs": {
+    "input": {
+      "shape": ["batch_size", "hidden_size"],
+      "dtype": "float16"
+    },
+    "weight": {
+      "shape": ["hidden_size"],
+      "dtype": "float16"
+    },
+    "eps": {
+      "shape": null,
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": ["batch_size", "hidden_size"],
+      "dtype": "float16"
+    }
+  },
+  "reference": "import torch\n\ndef run(input, weight, eps):\n    variance = input.to(torch.float32).pow(2).mean(-1, keepdim=True)\n    rstd = torch.rsqrt(variance + eps)\n    hidden_states = input * rstd\n    output = (hidden_states * weight).to(weight.dtype)\n    return output",
+}
+```
+
+### Example 6: Attention (GQA-4)
+
+```json
+{
+  "name": "gqa_hr4_dqk128_dvo128",
+  "description": "Grouped-Query Attention with a query-to-key-value head ratio of 4.",
+  "op_type": "gqa",
+  "tags": [
+    "status:draft",
+    "model:some_model"
+  ]
+  "axes": {
+    "B": { "type": "var" },
+    "Q": { "type": "var" },
+    "KV": { "type": "var" },
+    "H_qo": { "type": "var" },
+    "H_kv": { "type": "var" },
+    "H_r": { "type": "const", "value": 4 },
+    "D_qk": { "type": "const", "value": 128 },
+    "D_vo": { "type": "const", "value": 128 }
+  },
+  "constraints": [
+    "H_qo == H_kv * H_r"
+  ],
+  "inputs": {
+    "q": {
+      "shape": ["B", "Q", "H_qo", "D_qk"],
+      "dtype": "float16"
+    },
+    "k": {
+      "shape": ["B", "KV", "H_kv", "D_qk"],
+      "dtype": "float16"
+    },
+    "v": {
+      "shape": ["B", "KV", "H_kv", "D_vo"],
+      "dtype": "float16"
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": ["B", "Q", "H_qo", "D_vo"],
+      "dtype": "float16"
+    },
+    "lse": {
+      "shape": ["B", "Q", "H_qo"],
+      "dtype": "float32"
+    }
+  },
+  "reference": "...",
+}
+```
+
+
+# ===== docs/flashinfer-trace/workload.mdx =====
+---
+title: "Workload"
+---
+
+## Overview
+
+This document describes the JSON schema for a **Workload**.
+
+A `Workload` defines a concrete, executable instance of a [Definition](/docs/flashinfer-trace/definition) by binding specific values to all variable axes and specifying the data source for all inputs. It represents the exact configuration under which a `Solution` is benchmarked.
+
+**Storage Format:** In the FlashInfer-Bench dataset, a standalone Workload is stored using the [Trace](/docs/flashinfer-trace/trace) data structure with only the `definition` and `workload` fields populated, while `solution` and `evaluation` are set to `null`.
+
+In FlashInfer Trace dataset, all workloads of the same definition are stored in a single JSONL file where each line is a `Workload` object.
+
+## JSON Schema Description
+
+### Top-Level Object Structure
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `uuid` | string | Yes | A unique identifier for this workload configuration. |
+| `axes` | object | Yes | An object mapping `var` axis names from the `Definition` to their concrete integer values. |
+| `inputs` | object | Yes | An object describing the data source for each input. |
+
+### `inputs` : Input Descriptor Objects
+
+This object maps **input names** (e.g., `"A"`, `"weight"`, `"mask"`) to **input descriptors** that explain **where the data comes from** and (when necessary) **how it should be generated or loaded**.
+
+Each descriptor **must** contain at least the `type` field. Additional fields become **required or optional** depending on the chosen `type`.
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `type` | string | **Yes** | Data source type. Could be `random`, `scalar`, or `safetensors`. |
+
+Additional fields for type `scalar`:
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `value` | int, float, bool | **Yes** | The concrete value of the input. |
+
+Additional fields for type `safetensors`:
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `path` | string | **Yes** | Relative path or URI of the `.safetensors` file. |
+| `tensor_key` | string | **Yes** | The key inside the safetensors container that holds this tensor. |
+
+### Example: RMSNorm Workload
+
+```json
+{
+  "definition": "rmsnorm_d4096",
+  "workload": {
+    "uuid": "6120f144-b973-4bd9-b884-77ecb132914e",
+    "axes": {
+      "batch_size": 32
+    },
+    "inputs": {
+      "input": {
+        "type": "safetensors",
+        "path": "/data/rmsnorm_evals/b32_input.safetensors",
+        "tensor_key": "input"
+      },
+      "weight": {
+        "type": "safetensors",
+        "path": "/data/rmsnorm_evals/rmsnorm_weight.safetensors",
+        "tensor_key": "weight"
+      },
+      "eps": {
+        "type": "scalar",
+        "value": 1e-6
+      }
+    }
+  },
+  "solution": null,
+  "evaluation": null
+}
+```
+
+### Example: GEMM Workload with Random Inputs
+
+```json
+{
+  "definition": "gemm_n_4096_k_4096",
+  "workload": {
+    "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "axes": {
+      "M": 1024
+    },
+    "inputs": {
+      "A": {
+        "type": "random"
+      },
+      "B": {
+        "type": "random"
+      }
+    }
+  },
+  "solution": null,
+  "evaluation": null
+}
+```
+
+
+# ===== docs/flashinfer-trace/solution.mdx =====
+---
+title: "Solution"
+---
+
+## Overview
+
+This document describes the schema for a workload **Solution**.
+
+The `Solution` provides a concrete, high-performance implementation for a given [Definition](/docs/flashinfer-trace/definition). Each `Solution` is a self-contained entry submitted by community members or autonomous agents, encapsulating the source code and all metadata required for building, interfacing, and benchmarking. The `Solution` will be benchmarked to collect evaluation statistics to be stored in a [Trace object](/docs/flashinfer-trace/trace).
+
+> **Tip:** Visit [FlashInfer Bench Viewer](https://bench.flashinfer.ai/viewer) to see formatted code and visualized JSON for existing solutions.
+
+## JSON Schema Description
+
+### Top-Level Object Structure
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `name` | string | Yes | A unique, human-readable name for this specific solution (e.g.,`rmsnorm_triton_v1_h100`). |
+| `definition` | string | Yes | The`name`of the `Definition`this implementation solves. |
+| `description` | string | No | A human-readable brief description of the solution's technique or agent policy. |
+| `author` | string | Yes | The name of the author or agent system. |
+| `spec` | object | Yes | An object containing detailed technical specifications for the implementation. |
+| `sources` | array | Yes | An array of file objects representing the complete source code, including any necessary files for building and execution. |
+
+### `sources` : Source Code Files
+
+The `sources` array contains any number of file objects, where each object represents a single source file in the project. The `flashinfer-bench` benchmarker will reconstruct the project's directory structure to properly build the binaries/executables.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | string | Yes | The relative path of the file, including its name and extension (e.g., `src/kernel.cu`, `main.py`). |
+| `content` | string | Yes | The complete text content of the source file. |
+
+### `spec` : Build Specification
+
+This object details the build requirements and properties of the source code.
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `language` | string | Yes | The primary programming language: `python`, `triton`, `cpp`, or `cuda`. |
+| `target_hardware` | array | Yes | A list of hardware architectures this is compatible with (e.g., `NVIDIA_H100`, `NVIDIA_B200`). |
+| `entry_point` | string | Yes | The exact path to the function to be called. Format: `{file_path}::{function_name}` (e.g. `main.py::run`). |
+| `destination_passing_style` | bool | No | If `true` (default), outputs are passed as last arguments. If `false`, outputs are returned. See [Destination Passing Style](#destination-passing-style-dps). |
+| `binding` | string | No | Binding type for C++/CUDA solutions: `tvm-ffi` (default) or `torch`. Ignored for Python/Triton. See [Language-Specific Guidelines](#language-specific-guidelines). |
+| `dependencies` | array | No | A list of required libraries or toolchains. |
+
+
+### Dependencies Handling
+
+> **Note:** The `dependencies` field is currently only for semantic purposes and is not enforced.
+The support for dependencies is coming soon.
+
+The `dependencies` field is an array of strings declaring third-party packages needed to build/run the solution. In particular, we're handling the third-party CUDA libs and Python packages:
+
+- CUDA/C++: Use version-pinned tokens.
+
+  Example: `CUTLASS_3_7` → the builder injects CUTLASS 3.7 headers paths during compilation.
+
+- Python libs: You may list package specifiers, but we do not manage Python package installs currently. We only validate against the current environment. If a listed lib/version isn't satisfied, the build fails fast with a validation error.
+
+  Example: `torch`, `triton >= 2.3` → the builder validates the current environment for these packages and versions.
+
+
+## Destination Passing Style (DPS)
+
+The `destination_passing_style` field controls how outputs are handled:
+
+| Style | `destination_passing_style` | Signature | Description |
+| --- | --- | --- | --- |
+| **DPS** | `true` (default) | `run(input1, input2, ..., output1, output2, ...)` | Outputs are pre-allocated and passed as the last arguments. The function writes results in-place. |
+| **Value-returning** | `false` | `run(input1, input2, ...) -> output` | The function allocates and returns the output tensor(s). |
+
+**Example comparison:**
+
+```python
+# DPS (destination_passing_style: true)
+def run(input, weight, output):
+    # output is pre-allocated, write results in-place
+    output[:] = normalize(input, weight)
+
+# Value-returning (destination_passing_style: false)
+def run(input, weight):
+    # allocate and return the result
+    return normalize(input, weight)
+```
+
+**When to use which:**
+- **DPS (`true`)**: Preferred for performance-critical code. Avoids output allocation overhead.
+- **Value-returning (`false`)**: Simpler to write and doesn't need to manually allocate outputs.
+
+## Language-Specific Guidelines
+
+### Python / Triton
+
+For `python` and `triton` languages, the entry point is a Python function.
+
+**Signature requirements:**
+- Parameter names must exactly match the keys in `Definition.inputs` (and `Definition.outputs` for DPS).
+- The function is called with **positional arguments**.
+
+**Parameter handling:**
+- `*args`: Useful for flexible number of parameters. It requires (required params ≤ expected).
+- `**kwargs`: Ignored in signature validation.
+
+**Example (Triton with value-returning):**
+
+```python
+def run(input, weight, **kwargs):
+    # **kwargs is allowed and ignored in validation
+    output = torch.empty_like(input)
+    _triton_kernel[grid](input, weight, output, ...)
+    return output
+```
+
+### C++ / CUDA
+
+For `cpp` and `cuda` languages, the source code must be compiled. Use the `binding` field to specify how to interface with Python:
+
+| Binding | Description | Use Case |
+| --- | --- | --- |
+| `tvm-ffi` | TVM-FFI binding with DLPack interop. Framework-agnostic. | **Preferred** for most C++/CUDA solutions. |
+| `torch` | PyTorch C++/CUDA extension via `torch.utils.cpp_extension`. | When PyTorch-specific features are needed. |
+
+**Entry point:** The `entry_point` should reference a C/C++ function symbol that will be exposed to Python.
+
+**Example spec for CUDA:**
+
+```json
+{
+  "language": "cuda",
+  "target_hardware": ["NVIDIA_H100"],
+  "entry_point": "kernel.cu::my_kernel",
+  "binding": "tvm-ffi",
+  "destination_passing_style": true
+}
+```
+
+## Examples
+
+### Example: Triton Implementation for GEMM
+
+```json
+{
+  "name": "gemm_triton_h100_v1",
+  "definition": "gemm",
+  "description": "A high-performance GEMM implementation (C = A @ B.T) using Triton.",
+  "author": "gemini-2.5-pro-mystery-agent",
+  "spec": {
+    "language": "triton",
+    "target_hardware": ["NVIDIA_H100"],
+    "dependencies": [
+      "triton >= 2.3",
+      "torch"
+    ],
+    "entry_point": "main.py::run",
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.autotune(\n    configs=[\n        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),\n        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8)\n    ],\n    key=['M', 'N', 'K'],\n)\n@triton.jit\ndef _gemm_kernel(\n    A, B, C, M, N, K, stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr\n):\n    pid = tl.program_id(axis=0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    num_pid_in_group = GROUP_SIZE_M * num_pid_n\n    group_id = pid // num_pid_in_group\n    first_pid_m = group_id * GROUP_SIZE_M\n    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)\n    pid_m = first_pid_m + (pid % group_size_m)\n    pid_n = (pid % num_pid_in_group) // group_size_m\n\n    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:, None]\n    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :]\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    a_ptrs = A + (offs_am * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = B + (offs_bn * stride_bn + offs_k[:, None] * stride_bk)\n\n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):\n        a = tl.load(a_ptrs)\n        b = tl.load(b_ptrs)\n        accumulator += tl.dot(a, b)\n        a_ptrs += BLOCK_SIZE_K * stride_ak\n        b_ptrs += BLOCK_SIZE_K * stride_bk\n    c = accumulator.to(C.dtype.element_ty)\n\n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]\n    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)\n    tl.store(c_ptrs, c, mask=c_mask)\n\ndef run(A, B):\n    M, K = A.shape\n    N, _ = B.shape\n    C = torch.empty((M, N), device=A.device, dtype=A.dtype)\n    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )\n    _gemm_kernel[grid](A, B, C, M, N, K, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1))\n    return C"
+    }
+  ]
+}
+```
+
+### Example: Triton Implementation for RMS Norm
+
+```json
+{
+  "name": "rmsnorm_triton_v1",
+  "definition": "rmsnorm",
+  "description": "A high-performance RMSNorm implementation using Triton.",
+  "author": "gemini-2.5-pro-mystery-agent",
+  "spec": {
+    "language": "triton",
+    "target_hardware": ["NVIDIA_H100", "NVIDIA_A100", "NVIDIA_B200"],
+    "dependencies": [
+      "triton >= 2.3",
+      "torch"
+    ],
+    "entry_point": "main.py::run",
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "import torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef _rmsnorm_kernel(x_ptr, weight_ptr, output_ptr,\n                    x_row_stride, output_row_stride,\n                    n_cols, eps, \n                    BLOCK_SIZE: tl.constexpr):\n    # Get the row index for this program instance\n    row_idx = tl.program_id(0)\n\n    # Create pointers to the beginning of the current row\n    row_x_ptr = x_ptr + row_idx * x_row_stride\n    row_output_ptr = output_ptr + row_idx * output_row_stride\n\n    # --- Pass 1: Calculate mean of squares ---\n    var_acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)\n    for off in range(0, n_cols, BLOCK_SIZE):\n        cols = off + tl.arange(0, BLOCK_SIZE)\n        mask = cols < n_cols\n        # Load input data, converting to float32 for accumulation\n        x = tl.load(row_x_ptr + cols, mask=mask, other=0.0).to(tl.float32)\n        var_acc += x * x\n    \n    # Reduce the block-level accumulators to a single scalar value for the row variance\n    row_var = tl.sum(var_acc, axis=0) / n_cols\n    rstd = tl.rsqrt(row_var + eps)\n\n    # --- Pass 2: Normalize and apply weight ---\n    for off in range(0, n_cols, BLOCK_SIZE):\n        cols = off + tl.arange(0, BLOCK_SIZE)\n        mask = cols < n_cols\n\n        # Load input and weight\n        x = tl.load(row_x_ptr + cols, mask=mask, other=0.0)\n        w = tl.load(weight_ptr + cols, mask=mask, other=0.0)\n\n        # Normalize, apply weight, and store\n        x_normalized = x * rstd\n        output = x_normalized * w\n        tl.store(row_output_ptr + cols, output, mask=mask)\n\ndef run(input: torch.Tensor, weight: torch.Tensor, eps: float):\n    \"\"\"\n    Launcher function for the RMSNorm Triton kernel.\n\n    Args:\n        input (torch.Tensor): The input tensor of shape (batch_size, hidden_size).\n        weight (torch.Tensor): The weight tensor of shape (hidden_size).\n        eps (float): A small value to prevent division by zero.\n\n    Returns:\n        dict: A dictionary containing the output tensor under the key 'output'.\n    \"\"\"\n    # Ensure input tensor is contiguous in the last dimension\n    input = input.contiguous()\n    n_rows, n_cols = input.shape\n\n    # Create the output tensor\n    output = torch.empty_like(input)\n\n    # Pick a block size. 1024 is a good default for typical hidden sizes.\n    BLOCK_SIZE = 1024\n\n    # Define the grid for launching the kernel\n    # One program instance per row\n    grid = (n_rows,)\n\n    # Launch the kernel\n    _rmsnorm_kernel[grid](input, weight, output,\n                         input.stride(0), output.stride(0),\n                         n_cols, eps, \n                         BLOCK_SIZE=BLOCK_SIZE)\n    \n    return output"
+    }
+  ]
+}
+```
+
+
+# ===== docs/flashinfer-trace/trace.mdx =====
+---
+title: "Trace"
+---
+
+This document describes the JSON schema for a **Trace**.
+
+A `Trace` describes a benchmark result of a [Solution](/docs/flashinfer-trace/solution) on a [Definition](/docs/flashinfer-trace/definition) with a specific [Workload](/docs/flashinfer-trace/workload). The collection of all Trace files forms the database of benchmark results.
+
+In a `Trace` object, `solution` and `evaluation` are optional. If they are not provided, it describes
+a workload entry in the dataset.
+
+In a `Trace` object, the `definition` and `solution` are externally linked through their names;
+`workload` and `evaluation` are embedded in the `Trace` object. This is because `definition` and
+`solution` are relatively large objects and will be used repeatedly in the dataset.
+
+## JSON Schema Description
+
+### **Top-Level Object Structure**
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `definition` | string | Yes | The `name` of the `Definition` used in this run. |
+| `workload` | object | Yes | An object describing the specific input configuration for this run. See [Workload](/docs/flashinfer-trace/workload). |
+| `solution` | string | No | The `name` of the `Solution` tested in this run. |
+| `evaluation` | object | No | An object containing the detailed results of this run. |
+
+### `evaluation` : Benchmark Statistics Summary
+
+This object represents a single, complete benchmark result.
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `status` | string | Yes | The final status of the evaluation run. Has to be one of the following:
+`"PASSED"`, `"INCORRECT_SHAPE"`, `"INCORRECT_NUMERICAL"`, `"INCORRECT_DTYPE"`, `"RUNTIME_ERROR"`, `"COMPILE_ERROR"`. |
+| `log` | string | Yes | The embedded record of the stdout and stderr of the evaluation run. |
+| `correctness` | object | Yes | The summarized correctness results across all entries in the dataset. |
+| `performance` | object | Yes | The summarized performance metrics across all entries in the dataset. |
+| `environment` | object | Yes | A snapshot of the hardware and software execution environment. |
+| `timestamp` | string | Yes | The ISO 8601 timestamp of when this summary was generated. |
+
+### `correctness` : Correctness Summary
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `max_relative_error` | float | Yes | The maximum relative difference found. |
+| `max_absolute_error` | float | Yes | The maximum absolute difference found. |
+
+### `performance` : Performance Summary
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `latency_ms` | float | Yes | The mean latency in milliseconds per execution for this implementation. |
+| `reference_latency_ms` | float | Yes | The mean latency of the `Definition`'s reference code on the same data/hardware. |
+| `speedup_factor` | float | Yes | The calculated speedup (`reference_latency_ms / latency_ms`). |
+> Note that it's normal for the speedup factor to be very large since the references are torch only, unoptimized implementations.
+
+### **`environment`: Environment Definition Object**
+
+The `environment` object specifies the exact execution environment for this benchmark run.
+
+| **Field** | **Type** | **Required** | **Description** |
+| --- | --- | --- | --- |
+| `hardware` | string | Yes | The name of the hardware, e.g., `"NVIDIA_H100"`. |
+| `libs` | object | Yes | A snapshot of the relevant software libraries and their versions. Keys are library names, and values are version strings. |
+
+### The `correctness` and `performance` Nullable Table
+The `correctness` and `performance` fields are set to be nullable depending on the `status`.
+| status | correctness | performance |
+| --- | --- | --- |
+| PASSED | Required | Required |
+| INCORRECT_NUMERICAL | Required | **None** |
+| INCORRECT_SHAPE/DTYPE | **None** | **None** |
+| RUNTIME_ERROR | **None** | **None** |
+| COMPILE_ERROR | **None** | **None** |
+
+### Example: RMSNorm Trace
+
+```python
+{
+  "definition": "rmsnorm",
+  "solution": "rmsnorm_triton_v1",
+  "workload": {
+    "uuid": "6120f144-b973-4bd9-b884-77ecb132914e",
+    "axes": {
+      "batch_size": 32
+    },
+    "inputs": {
+      "input": {
+        "type": "safetensors",
+        "path": "/data/rmsnorm_evals/b32_input.safetensors",
+        "tensor_key": "input"
+      },
+      "weight": {
+        "type": "safetensors",
+        "path": "/data/rmsnorm_evals/rmsnorm_weight.safetensors",
+        "tensor_key": "weight"
+      }
+    }
+  },
+  "evaluation": {
+    "status": "PASSED",
+    "log": "...",
+    "correctness": {
+      "max_relative_error": 1.15e-05,
+      "max_absolute_error": 0.89e-05
+    },
+    "performance": {
+      "latency_ms": 0.008,
+      "reference_latency_ms": 0.019,
+      "speedup_factor": 2.375
+    },
+    "environment": {
+      "hardware": "NVIDIA_H100",
+      "libs": {
+        "cuda": "12.6",
+        "torch": "2.6.0",
+        "triton": "2.4.0"
+      }
+    },
+    "timestamp": "2025-06-27T12:45:00Z"
+  }
+}
+```
+
+
+# ===== docs/op-types/mla-paged.mdx =====
+---
+title: "MLA Paged"
+---
+
+ Multi-head Latent Attention (MLA) with paged memory layout. MLA is an advanced attention mechanism that decomposes the key-value representation into separate compressed key-value (CKV) and key positional encoding (KPE) components to reduce memory usage while maintaining model performance. The paged layout enables efficient memory management for variable-length sequences.
+
+Variants:
+- prefill
+- decode
+
+## prefill
+
+Axes (8 dimensions):
+- `total_q`, `num_pages`, `len_indptr`, `num_kv_indices`: variable
+- `num_qo_heads`, `head_dim_ckv`, `head_dim_kpe`, `page_size`: constant
+
+Inputs (7 tensors + 1 scalar):
+- `q_nope`: query tensor without positional encoding [total_q, num_qo_heads, head_dim_ckv]
+- `q_pe`: query positional encoding component [total_q, num_qo_heads, head_dim_kpe]
+- `ckv_cache`: compressed key-value cache [num_pages, page_size, head_dim_ckv]
+- `kpe_cache`: key positional encoding cache [num_pages, page_size, head_dim_kpe]
+- `qo_indptr`, `kv_indptr`, `kv_indices`: paging indices
+- `sm_scale`: softmax scale (scalar)
+
+Outputs (2 tensors):
+- `output`: attention output [total_q, num_qo_heads, head_dim_ckv]
+- `lse`: log-sum-exp values [total_q, num_qo_heads]
+
+Constraints:
+- `total_q == qo_indptr[-1]`
+- `num_kv_indices = kv_indptr[-1]`
+
+## decode
+
+Axes (8 dimensions):
+- `batch_size`, `num_pages`, `len_indptr`, `num_kv_indices`: variable
+- `num_qo_heads`, `head_dim_ckv`, `head_dim_kpe`, `page_size`: constant
+
+Inputs (6 tensors + 1 scalar):
+- `q_nope`: query tensor without positional encoding [batch_size, num_qo_heads, head_dim_ckv]
+- `q_pe`: query positional encoding [batch_size, num_qo_heads, head_dim_kpe]
+- `ckv_cache`: compressed key-value cache [num_pages, page_size, head_dim_ckv]
+- `kpe_cache`: key positional encoding cache [num_pages, page_size, head_dim_kpe]
+- `kv_indptr`, `kv_indices`: paging indices
+- `sm_scale`: softmax scale (scalar)
+
+Outputs (2 tensors):
+- `output`: attention output [batch_size, num_qo_heads, head_dim_ckv]
+- `lse`: log-sum-exp values [batch_size, num_qo_heads]
+
+Constraints:
+- `len_indptr = num_pages + 1`
+- `num_kv_indices = kv_indptr[-1]`
+
+
+# ===== docs/op-types/dsa-paged.mdx =====
+---
+title: "DSA Paged"
+---
+
+DeepSeek Sparse Attention (DSA) with paged memory layout. DSA is a two-stage sparse attention mechanism: first an indexer selects top-K relevant KV cache entries using ReLU scoring, then MLA-style attention is performed only on selected entries. This reduces attention computation from O(n) to O(k) where `k << n`.
+
+Variants:
+- indexer
+- sparse_attention
+
+## indexer
+
+Computes sparse attention scores using ReLU activation and learned weights, then selects top-K KV cache indices. Uses FP8 quantization with deep_gemm format.
+
+Axes (9 dimensions):
+- `batch_size`, `max_num_pages`, `num_pages`: variable
+- `num_index_heads`, `index_head_dim`, `page_size`, `topk`, `kv_cache_num_heads`, `head_dim_with_scale`: constant
+
+Inputs (5 tensors):
+- `q_index_fp8`: FP8 query for indexing [batch_size, num_index_heads, index_head_dim]
+- `k_index_cache_fp8`: FP8 key index cache with scales [num_pages, page_size, kv_cache_num_heads, head_dim_with_scale]
+- `weights`: learned head weights [batch_size, num_index_heads]
+- `seq_lens`: sequence lengths [batch_size]
+- `block_table`: page mapping [batch_size, max_num_pages]
+
+Outputs (1 tensor):
+- `topk_indices`: selected token indices [batch_size, topk], -1 indicates padding
+
+Constraints:
+- `topk <= max_num_pages * page_size`
+- `num_index_heads == 64`, `index_head_dim == 128` (deep_gemm requirement)
+- `head_dim_with_scale == 132` (128 + 4 scale bytes)
+
+## sparse_attention
+
+Performs MLA-style attention on top-K selected KV entries. Works for both prefill (multiple tokens) and decode (one token per sequence) - the computation is identical, only the first dimension differs.
+
+Axes (7 dimensions):
+- `num_tokens`, `num_pages`: variable
+- `num_qo_heads`, `head_dim_ckv`, `head_dim_kpe`, `page_size`, `topk`: constant
+
+Inputs (5 tensors + 1 scalar):
+- `q_nope`: query without positional encoding [num_tokens, num_qo_heads, head_dim_ckv]
+- `q_pe`: query positional encoding [num_tokens, num_qo_heads, head_dim_kpe]
+- `ckv_cache`: compressed KV cache [num_pages, page_size, head_dim_ckv]
+- `kpe_cache`: key positional encoding cache [num_pages, page_size, head_dim_kpe]
+- `sparse_indices`: top-K indices per token [num_tokens, topk], -1 indicates padding
+- `sm_scale`: softmax scale (scalar)
+
+Outputs (2 tensors):
+- `output`: attention output [num_tokens, num_qo_heads, head_dim_ckv]
+- `lse`: 2-based log-sum-exp [num_tokens, num_qo_heads]
+
+Constraints:
+- `sparse_indices.shape[0] == num_tokens`
+- `sparse_indices.shape[-1] == topk`
+- `ckv_cache.shape[1] == page_size`
+
+
+# ===== docs/op-types/moe.mdx =====
+---
+title: "MoE"
+---
+
+Mixture of Experts (MoE) divides computation among multiple expert subnetworks. The MoE layer in DeepSeek is a transformer feed-forward block replaced by a sparse mixture of many MLP experts, where only a few are chosen for each token by a gating network.
+
+Axes (9 dimensions):
+- `seq_len`: variable
+- `num_experts`, `num_local_experts`, `hidden_size`, `intermediate_size`, `gemm1_out_size`, `num_hidden_blocks`, `num_intermediate_blocks`, `num_gemm1_out_blocks`: constant
+
+Inputs (8 tensors + 2 scalars):
+- `routing_logits`: Tensor of routing logits for expert selection [seq_len, num_experts]
+- `routing_bias`: Bias tensor for routing. Pass all zeros for no bias [num_experts]
+- `hidden_states`: Input hidden states tensor (FP8 quantized) [seq_len, hidden_size]
+- `hidden_states_scale`: Block-wise scaling factors for hidden states [num_hidden_blocks, seq_len]
+- `gemm1_weights`: First GEMM weights for all local experts (gate and up projections) [num_local_experts, gemm1_out_size, hidden_size]
+- `gemm1_weights_scale`: Block-wise scaling factors for first GEMM weights [num_local_experts, num_gemm1_out_blocks, num_hidden_blocks]
+- `gemm2_weights`: Second GEMM weights for all local experts (down projection) [num_local_experts, hidden_size, intermediate_size]
+- `gemm2_weights_scale`: Block-wise scaling factors for second GEMM weights [num_local_experts, num_hidden_blocks, num_intermediate_blocks]
+- `local_expert_offset`: Offset of local experts in global expert space (scalar)
+- `routed_scaling_factor`: Scaling factor for routing weights (scalar)
+
+Outputs (1 tensor):
+- `output`: Final MoE output tensor [seq_len, hidden_size]
+
+
+# ===== docs/op-types/rope.mdx =====
+---
+title: "RoPE"
+---
+
+Rotary Position Embedding (RoPE) applies rotary transformations to query and key tensors before attention, encoding positional information directly into the attention mechanism. Uses a pre-computed cos/sin cache indexed by position IDs, matching the FlashInfer API `flashinfer.rope.apply_rope_with_cos_sin_cache_inplace`.
+
+Variants:
+- Full RoPE: rotary dimension equals head size (`rotary_dim == head_size`)
+- Partial RoPE: rotary dimension is less than head size (`rotary_dim < head_size`)
+
+Rotation styles:
+- NeoX-style (`is_neox=True`): split first/second half of rotary dimensions
+- GPT-J interleaved (`is_neox=False`): rotate even/odd indices
+
+Axes (6 dimensions):
+- `num_tokens`: variable
+- `num_qo_heads`: variable
+- `num_kv_heads`: variable
+- `max_seq_len`: variable
+- `head_size`: constant
+- `rotary_dim`: constant
+
+Inputs (4):
+- `q`: [num_tokens, num_qo_heads, head_size]
+- `k`: [num_tokens, num_kv_heads, head_size]
+- `cos_sin_cache`: [max_seq_len, rotary_dim] (float32, first half cos, second half sin)
+- `positions`: [num_tokens] (int64, index into cos_sin_cache)
+
+Note: Rotation style (NeoX vs GPT-J) is encoded in the definition name rather than as an input parameter, following the 1-kernel-1-definition principle. For example: `rope_with_cos_sin_cache_neox_style_d128_rd64` vs `rope_with_cos_sin_cache_gptj_style_d128_rd64`.
+
+Outputs (2 tensors, in-place):
+- `q_out`: [num_tokens, num_qo_heads, head_size]
+- `k_out`: [num_tokens, num_kv_heads, head_size]
+
+
+# ===== docs/op-types/rmsnorm.mdx =====
+---
+title: "RMSNorm"
+---
+
+ Root Mean Square Layer Normalization (RMSNorm) is a normalization technique that normalizes the input by the root mean square of its elements.
+
+Variants:
+- Standard RMSNorm: basic RMS normalization that scales input by RMS and applies learned weight parameters
+- Fused Add RMSNorm: adds residual connection before normalization in a single fused operation
+
+Axes (2 dimensions):
+- `batch_size`: variable
+- `hidden_size`: constant
+
+Inputs (2 or 3 tensors):
+- `hidden_states`: [batch_size, hidden_size]
+- `weight`: [hidden_size]
+- For Fused Add RMSNorm only:
+    - `residual`: [batch_size, hidden_size]
+
+Outputs (1 tensor):
+- `output`: [batch_size, hidden_size]
+
+
+# ===== README.md =====
+<div align="center" id="top">
+
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/logo/fib-white-bg.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo/fib-black-bg.png">
+  <img src="docs/logo/fib-white-bg.png" alt="FlashInfer-Bench logo" width="400">
+</picture>
+
+
+[![Documentation](https://img.shields.io/badge/docs-latest-green)](https://bench.flashinfer.ai/docs/)
+[![License](https://img.shields.io/badge/license-apache_2-blue)](https://github.com/flashinfer-ai/flashinfer-bench/blob/main/LICENCE)
+[![PyPI](https://img.shields.io/pypi/v/flashinfer-bench)](https://pypi.org/project/flashinfer-bench/)
+
+**Building the Virtuous Cycle for AI-driven LLM Systems**
+
+[Get Started](#get-started) | [Documentation](https://bench.flashinfer.ai/docs/) | [Blogpost](https://flashinfer.ai/2025/10/21/flashinfer-bench.html)
+| [Slack (#flashinfer-bench)](https://join.slack.com/t/flashinfer/shared_invite/zt-379wct3hc-D5jR~1ZKQcU00WHsXhgvtA) </div>
+
+**FlashInfer-Bench** is a benchmark suite and production workflow designed to build a virtuous cycle of self-improving AI systems.
+
+It is part of a broader initiative to build the *virtuous cycle of AI improving AI systems* — enabling AI agents and engineers to collaboratively optimize the very kernels that power large language models.
+
+## Installation
+
+Install FlashInfer-Bench with pip:
+
+```bash
+pip install flashinfer-bench
+```
+
+Import FlashInfer-Bench:
+
+```python
+import flashinfer_bench as fib
+
+print(fib.__version__)
+```
+
+## Get Started
+
+This [guide](https://bench.flashinfer.ai/docs/start/quickstart) shows you how to use FlashInfer-Bench python module with the FlashInfer-Trace dataset.
+
+## FlashInfer Trace Dataset
+
+We provide an official dataset called **FlashInfer-Trace** with kernels and workloads in real-world AI system deployment environments. FlashInfer-Bench can use this dataset to measure and compare the performance of kernels. It follows the [FlashInfer Trace Schema](https://bench.flashinfer.ai/docs/flashinfer-trace).
+
+The official dataset is on HuggingFace: https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace
+
+Clone it with Git LFS pointer files only (large tensor files are downloaded on demand during benchmarking):
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace
+flashinfer-bench run --local flashinfer-trace
+```
+
+## Collaborators
+
+Our collaborators include:
+
+<div align="center">
+
+[<img src="https://raw.githubusercontent.com/mlc-ai/XGrammar-web-assets/refs/heads/main/repo/nvidia.svg" height=50/>](https://github.com/NVIDIA/TensorRT-LLM)
+&emsp;
+[<img src="https://raw.githubusercontent.com/mlc-ai/XGrammar-web-assets/refs/heads/main/repo/gpu_mode.png" height=50/>](https://github.com/gpu-mode)
+&emsp;
+[<img src="https://raw.githubusercontent.com/mlc-ai/XGrammar-web-assets/refs/heads/main/repo/sglang.png" height=50/>](https://github.com/sgl-project/sglang)
+&emsp;
+[<img src="https://raw.githubusercontent.com/mlc-ai/XGrammar-web-assets/refs/heads/main/repo/vllm.png" height=50/>](https://github.com/vllm-project/vllm)
+&emsp;
+[<img src="https://raw.githubusercontent.com/mlc-ai/XGrammar-web-assets/refs/heads/main/repo/bosch.svg" height=50/>](https://www.bosch.com/)
+
+</div>

@@ -53,6 +53,19 @@ import torch
 V4_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash"
 V2_MODEL_ID = "deepseek-ai/DeepSeek-V2-Lite"
 
+# Pinned, for the same reason third_party/ is pinned: everything this repository
+# measures derives from these weights, and "whatever main pointed at that day"
+# is not a provenance. A hub repo can be force-pushed or re-quantised in place.
+MODEL_REVISION = {
+    V4_MODEL_ID: "60d8d70770c6776ff598c94bb586a859a38244f1",
+    V2_MODEL_ID: "604d5664dddd88a0433dbae533b7fe9472482de0",
+}
+
+
+def revision(model_id: str) -> str:
+    return MODEL_REVISION[model_id]
+
+
 # An HCA layer (compress_ratios[11] == 128), far enough up the stack to be
 # representative of the steady state rather than of the input embedding.
 DEFAULT_LAYER = 11
@@ -69,7 +82,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 def _index(model_id: str) -> Dict[str, str]:
     from huggingface_hub import hf_hub_download
 
-    p = hf_hub_download(model_id, "model.safetensors.index.json")
+    p = hf_hub_download(model_id, "model.safetensors.index.json", revision=revision(model_id))
     return json.loads(pathlib.Path(p).read_text())["weight_map"]
 
 
@@ -77,7 +90,8 @@ def _index(model_id: str) -> Dict[str, str]:
 def config(model_id: str = V4_MODEL_ID) -> Dict:
     from huggingface_hub import hf_hub_download
 
-    return json.loads(pathlib.Path(hf_hub_download(model_id, "config.json")).read_text())
+    p = hf_hub_download(model_id, "config.json", revision=revision(model_id))
+    return json.loads(pathlib.Path(p).read_text())
 
 
 def _get_tensors(model_id: str, keys: List[str]) -> Dict[str, torch.Tensor]:
@@ -96,7 +110,7 @@ def _get_tensors(model_id: str, keys: List[str]) -> Dict[str, torch.Tensor]:
 
     out: Dict[str, torch.Tensor] = {}
     for shard, shard_keys in by_shard.items():
-        path = hf_hub_download(model_id, shard)
+        path = hf_hub_download(model_id, shard, revision=revision(model_id))
         with safe_open(path, framework="pt") as h:
             for k in shard_keys:
                 out[k] = h.get_tensor(k).contiguous()
@@ -182,7 +196,16 @@ def rope_tables(
 
 
 def v2lite_latents_path(layer: int, num_tokens: int) -> pathlib.Path:
-    return REPO / "data" / "latents" / f"v2lite_L{layer}_n{num_tokens}.safetensors"
+    # The corpus digest is in the filename on purpose. The harvest is a pure
+    # function of (model, layer, num_tokens, corpus), and the first three were
+    # already in the name; leaving the fourth out is what let a cache written
+    # against one corpus be served silently after the corpus changed.
+    return (
+        REPO
+        / "data"
+        / "latents"
+        / f"v2lite_L{layer}_n{num_tokens}_c{corpus_digest()}.safetensors"
+    )
 
 
 @torch.inference_mode()
@@ -210,14 +233,17 @@ def harvest_v2lite(
     cfg = config(V2_MODEL_ID)
     rank = cfg["kv_lora_rank"]
 
-    tok = AutoTokenizer.from_pretrained(V2_MODEL_ID)
+    tok = AutoTokenizer.from_pretrained(V2_MODEL_ID, revision=revision(V2_MODEL_ID))
     ids = tok(corpus_text(), return_tensors="pt").input_ids[0]
     if ids.numel() < num_tokens:
         ids = ids.repeat(-(-num_tokens // max(int(ids.numel()), 1)))
     ids = ids[:num_tokens]
 
     model = AutoModelForCausalLM.from_pretrained(
-        V2_MODEL_ID, dtype=torch.bfloat16, device_map="cuda"
+        V2_MODEL_ID,
+        revision=revision(V2_MODEL_ID),
+        dtype=torch.bfloat16,
+        device_map="cuda",
     ).eval()
 
     hidden: List[torch.Tensor] = []
@@ -295,24 +321,63 @@ def channel_profile(x: torch.Tensor) -> Dict[str, float]:
     }
 
 
+CORPUS_PATH = REPO / "tools" / "corpus" / "hca_v1.txt"
+
+# Asserted, not merely recorded. Everything downstream -- the harvested
+# activations, the workload blobs built from them, and the traces measured on
+# those blobs -- is a pure function of this text, so a silent edit would
+# invalidate committed numbers with no other symptom.
+CORPUS_SHA256 = "3e3b3cf574217c6921adee3189981483d3e7fe599afea42262318cdf43a46b8f"
+
+
 def corpus_text() -> str:
     """Real text to drive a forward pass with.
 
     Activation statistics only mean anything on in-distribution input: random
     token ids give a garbage hidden state and therefore garbage channel scales.
-    This uses the repo's own long-form technical prose plus the library's V4
-    implementation, which is squarely in a code model's training distribution
-    and needs no dataset download.
-    """
-    import transformers.models.deepseek_v4.modeling_deepseek_v4 as m
+    This is real technical code and prose -- squarely in a code model's training
+    distribution -- and needs no dataset download.
 
-    parts = []
-    for p in (REPO / "tasks" / "HCA.md", pathlib.Path(m.__file__)):
-        if p.exists():
-            parts.append(p.read_text())
-    if not parts:
-        raise RuntimeError("no corpus text found")
-    return "\n\n".join(parts)
+    It is a *frozen snapshot*, and that is the point. An earlier version built
+    the corpus live from ``tasks/HCA.md`` plus the installed transformers'
+    ``modeling_deepseek_v4`` source. Both drift: the first is a document this
+    repository edits constantly, making the workload data a function of its own
+    task write-up, and the second changes with a library upgrade. The harvest is
+    memoised on disk, so the drift was invisible -- the cache here was written at
+    12:40 and HCA.md was edited at 13:51 the same day, and nothing said so.
+
+    Provenance of the snapshot: the concatenation of sixteen files from the
+    vendored flashinfer-bench tree at the pin recorded in third_party/VENDOR.md
+    (four data-schema modules, the bench config, the builder, four trace-format
+    docs, five op_type specs, and the README), each prefixed with its path.
+    Those particular files were chosen because none of them is touched by
+    third_party/patches/, so the snapshot does not move when the patch series
+    does. The snapshot is nonetheless the authority; the file list is only how it
+    was produced.
+    """
+    import hashlib
+
+    if not CORPUS_PATH.exists():
+        raise RuntimeError(f"corpus snapshot missing: {CORPUS_PATH}")
+    text = CORPUS_PATH.read_text()
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    if digest != CORPUS_SHA256:
+        raise RuntimeError(
+            f"corpus snapshot changed: {CORPUS_PATH}\n"
+            f"  expected sha256 {CORPUS_SHA256}\n"
+            f"  found    sha256 {digest}\n"
+            "Every blob and every recorded trace derives from this text. If the "
+            "change is intended, bump CORPUS_SHA256, regenerate the blobs "
+            "(tools/gen_workload_blobs.py) and re-run the sweep "
+            "(tools/run_benchmark.py) -- the old traces no longer describe the "
+            "new inputs."
+        )
+    return text
+
+
+def corpus_digest() -> str:
+    """Short digest of the corpus, used to key the activation cache."""
+    return CORPUS_SHA256[:12]
 
 
 def describe(t: torch.Tensor) -> str:

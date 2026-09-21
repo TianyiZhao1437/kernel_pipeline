@@ -1,5 +1,5 @@
 diff --git a/flashinfer_bench/bench/eval_config.yaml b/flashinfer_bench/bench/eval_config.yaml
-index 2b29c56..94d5cbe 100644
+index 2b29c56..37ebb66 100644
 --- a/flashinfer_bench/bench/eval_config.yaml
 +++ b/flashinfer_bench/bench/eval_config.yaml
 @@ -8,3 +8,21 @@ op_type_config:
@@ -10,7 +10,7 @@ index 2b29c56..94d5cbe 100644
 +    # Bitwise equality is unsatisfiable here: the op reduces a 128-token softmax
 +    # in fp32 and emits fp8, so any reassociation of the sum moves a few output
 +    # bytes by one e4m3 code point. 0.999 is the measured separation between a
-+    # correct Triton kernel (worst 0.99998692 over the sweep) and eight
++    # correct Triton kernel (worst 0.99998256 over the sweep) and eight
 +    # deliberate semantic mutations (best 0.96282). Derived in
 +    # tasks/hca_compress_c128/eval_config.yaml.
 +    required_matched_ratio: 0.999

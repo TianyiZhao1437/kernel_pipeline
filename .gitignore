@@ -21,5 +21,10 @@ __pycache__/
 /dist/
 /logs/
 
+# tools/gen_workload_blobs.py writes the rewritten sweep beside the authored one
+# rather than over it, so the diff can be reviewed before promoting by rename.
+# The intermediate is a build artefact; the promoted <definition>.jsonl is not.
+tasks/*/*.real.jsonl
+
 # OS
 .DS_Store
