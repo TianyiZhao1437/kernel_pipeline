@@ -8,7 +8,7 @@
     "model:deepseek-v4",
     "quantization:float8_e4m3fn",
     "fused",
-    "status:draft"
+    "status:verified"
   ],
   "axes": {
     "num_compressed": {

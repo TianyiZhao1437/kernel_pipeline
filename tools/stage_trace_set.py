@@ -17,6 +17,7 @@ So the layout written here is the strict one, which satisfies both::
     <root>/workloads/<op_type>/<definition>.jsonl                       (2 parts)
     <root>/solutions/<author>/<op_type>/<definition>/<solution>.json    (4 parts)
     <root>/traces/<author>/<op_type>/<definition>.jsonl                 (3 parts)
+    <root>/tests/references/test_<definition>.py                        (flat)
 
 Every path component is also a *field* -- the validator cross-checks op_type,
 author, definition and solution name against the JSON -- so the filename of a
@@ -63,6 +64,7 @@ import json
 import pathlib
 import shutil
 import sys
+from typing import Dict
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import fib_shim  # noqa: E402  (needs the path above)
@@ -106,6 +108,20 @@ def stage(
         shutil.copy2(path, dest)
         log(f"  definition  {defn.name}  -> {dest.relative_to(root)}")
 
+        # The dataset keeps one reference test per definition at
+        # tests/references/test_<definition>.py, at the root rather than beside
+        # the definition. The test resolves its own paths from parents[2], which
+        # is the task directory here and the root once staged, so it is copied
+        # unchanged.
+        test_src = task_dir / "tests" / "references" / f"test_{defn.name}.py"
+        if test_src.is_file():
+            test_dest = root / "tests" / "references" / test_src.name
+            test_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(test_src, test_dest)
+            log(f"  test        {defn.name}  -> {test_dest.relative_to(root)}")
+        else:
+            log(f"  test        {defn.name}  -- none (expected {test_src.relative_to(task_dir)})")
+
     for path, sol in solutions:
         if sol.definition not in definitions:
             raise SystemExit(
@@ -123,6 +139,13 @@ def stage(
     # Workload files must be named for the definition they belong to and sit
     # under the op_type, because that is where a run dumps its own workloads and
     # where every other tool expects to find them.
+    #
+    # Two files in one task can therefore collide: the sweep is named for the
+    # definition, and gen_workload_blobs.py writes its rewritten copy beside it
+    # as <definition>.real.jsonl rather than over it, so the reviewed-and-
+    # promoted sweep and an unpromoted regeneration both map here. Copying both
+    # would silently keep whichever sorted last.
+    staged_workloads: Dict[str, pathlib.Path] = {}
     for path in sorted(task_dir.glob("*.jsonl")):
         traces = [
             data.Trace.model_validate(json.loads(line))
@@ -145,6 +168,14 @@ def stage(
             )
         op_type = definitions[name][1].op_type
         dest = root / "workloads" / op_type / f"{name}.jsonl"
+        if name in staged_workloads:
+            raise SystemExit(
+                f"{path.name} and {staged_workloads[name].name} both provide the workloads for "
+                f"'{name}' and would stage to the same path. This normally means an unpromoted "
+                f"regeneration is sitting beside the promoted sweep: review the diff, promote the "
+                f"one you mean by renaming it over the other, and remove the leftover."
+            )
+        staged_workloads[name] = path
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, dest)
         log(f"  workloads   {len(traces):>3} x {name}  -> workloads/{op_type}/{dest.name}")

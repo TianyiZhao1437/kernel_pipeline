@@ -137,7 +137,25 @@ DEFINITION = {
         "model:deepseek-v4",
         "quantization:float8_e4m3fn",
         "fused",
-        "status:draft",
+        # status:verified rather than status:draft. Upstream defines the tag
+        # loosely ("community/validation status"), so the bar taken here is the
+        # one the dataset's own verified definitions meet: the reference is
+        # checked against an independent implementation, and there is a
+        # reference test that says so. Both hold --
+        # tests/references/test_hca_compress_c128_h512_r64.py asserts the
+        # reference is bitwise equal to a transcription of vLLM's fused kernel
+        # at three sizes, that fp8/scale round-trip within half an e4m3 ulp, and
+        # that the configured tolerance rejects eight semantic mutations. On top
+        # of that, 40/40 traces pass over 20 workloads and all seven validator
+        # checks are green.
+        #
+        # What is NOT claimed by this tag: that DeepSeek-V4-Flash itself was run
+        # end to end. It was not -- the hidden states feeding the compressor are
+        # lifted from DeepSeek-V2-Lite (tools/gen_workload_blobs.py), and the
+        # UE8M0 exponent coverage is one-sided at the top. Those are workload
+        # coverage limits, recorded in eval_config.yaml, not doubts about what
+        # the definition computes.
+        "status:verified",
     ],
     "axes": {
         "num_compressed": {
