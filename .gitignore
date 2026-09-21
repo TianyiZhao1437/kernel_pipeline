@@ -1,0 +1,20 @@
+# Credentials
+.env*
+
+# Vendored upstream sources are committed deliberately -- see
+# third_party/VENDOR.md. Nothing under it needs to be ignored again.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+
+# Pipeline state and outputs
+data/
+jobs/
+dist/
+logs/
+
+# OS
+.DS_Store
