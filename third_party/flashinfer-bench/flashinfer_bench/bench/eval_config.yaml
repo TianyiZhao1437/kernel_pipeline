@@ -8,3 +8,11 @@ op_type_config:
     extra:
       sampling_validation_trials: 100
       sampling_tvd_threshold: 0.2
+  hca_compress:
+    # Bitwise equality is unsatisfiable here: the op reduces a 128-token softmax
+    # in fp32 and emits fp8, so any reassociation of the sum moves a few output
+    # bytes by one e4m3 code point. 0.999 is the measured separation between a
+    # correct Triton kernel (worst 0.99998692 over the sweep) and eight
+    # deliberate semantic mutations (best 0.96282). Derived in
+    # tasks/hca_compress_c128/eval_config.yaml.
+    required_matched_ratio: 0.999

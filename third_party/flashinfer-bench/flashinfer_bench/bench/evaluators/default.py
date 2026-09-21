@@ -17,6 +17,7 @@ from flashinfer_bench.bench.utils import (
     gen_inputs,
     load_safetensors,
     make_eval,
+    nonfinite_value,
 )
 from flashinfer_bench.compile import BuilderRegistry, Runnable
 from flashinfer_bench.data import (
@@ -138,11 +139,7 @@ class DefaultEvaluator(Evaluator):
                     )
 
                 # Non-finite values check
-                non_finite_err_val = None
-                if torch.isinf(sol_tensor).any().item():
-                    non_finite_err_val = float("inf")
-                elif torch.isnan(sol_tensor).any().item():
-                    non_finite_err_val = float("nan")
+                non_finite_err_val = nonfinite_value(sol_tensor)
 
                 if non_finite_err_val is not None:
                     correctness = Correctness(

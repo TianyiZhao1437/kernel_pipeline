@@ -102,6 +102,29 @@ the pin is meaningful.
 
 ---
 
+### Patches (`third_party/patches/`)
+
+The vendored tree carries three local patches. They are kept as a numbered
+series so that a pin bump — which replaces the tree wholesale and therefore
+discards them — can replay them with `third_party/patches/apply.sh`, and so that
+each one maps 1:1 to an upstream PR when it is filed.
+
+| Patch | Touches | Why |
+|---|---|---|
+| `001-fp8-nonfinite-check` | `bench/utils.py`, 3 evaluators | `torch.isinf` has no kernel for `float8_e4m3fn` — the format is finite-only, so it has no inf encoding at all. Calling it raises `NotImplementedError`, which surfaces as RUNTIME_ERROR on **every** workload of **any** definition with an fp8 output. Adds `nonfinite_value()`, which upcasts narrow floats (exact: each is a strict subset of float32) and is used at the three call sites that screened tensors this way. |
+| `002-hca-compress-eval-routing` | `bench/evaluators/lowbit.py`, `bench/eval_config.yaml` | Routes `op_type: hca_compress` to `LowBitEvaluator`, which records `matched_ratio` — the quantity this repository's tolerances are derived against — and registers its measured `required_matched_ratio: 0.999` in the bundled per-op_type config. Follows upstream's own idiom; `LowBitEvaluator` and `DsaSparseAttentionEvaluator` both hardcode the definitions they claim. |
+| `003-validate-uses-bundled-eval-config` | `data/validate.py` | `check_benchmark_content` built a bare `BenchmarkConfig`, so it never loaded the bundled `eval_config.yaml`. Any definition whose op_type sets a tolerance there was validated at the `compute_error_stats` fallback of 1.0 — bitwise equality — and failed under `validate` while passing under `run`. |
+
+Patch 001 is a plain upstream bug and is the one worth filing first; 003 is
+arguably one too. 002 is this repository's own hook and would be expressed
+differently upstream, since `hca_compress` is not an upstream op_type.
+
+This is a deliberate exception to "never patch a vendored file in place" below,
+taken because the alternative — the out-of-tree evaluator shim this replaced —
+made the emitted TraceSet unusable by anyone running the stock CLI. The property
+that rule protects (reproducible, reviewable upgrades) is preserved by keeping
+the patches reviewable and replayable rather than by having none.
+
 ## Why a copy and not a submodule
 
 The task format and the evaluation protocol are the binding specification for
@@ -114,7 +137,9 @@ newer upstream is an explicit, reviewable commit.
 ## Updating a pin
 
 1. Clone upstream at the new commit into a temporary directory.
-2. Replace the tree wholesale — never patch a vendored file in place.
+2. Replace the tree wholesale — never patch a vendored file in place. Local
+   changes live in `third_party/patches/` as a replayable series, never as an
+   edit that the next bump would silently revert.
 3. Recreate any symlinks the copy does not carry, and re-check `git ls-files -s`
    against the clone for mode `120000` entries.
 4. **Verify nothing was silently excluded.** Diff the file list actually staged
@@ -122,6 +147,10 @@ newer upstream is an explicit, reviewable commit.
    than trusting that the copy landed. A `.gitignore` pattern matching inside a
    vendored tree produces a repository that looks complete and is not; see the
    incident above.
-5. Update the table above.
-6. Re-run the test suite; a changed result against the reference problems is the
+5. Re-apply the patch series: `third_party/patches/apply.sh`. A rejected hunk is
+   information — upstream moved the code the patch depends on, or fixed it. Drop
+   the patch if upstream fixed it; otherwise reread upstream rather than forcing
+   it. The script is idempotent and skips patches already present.
+6. Update the table above.
+7. Re-run the test suite; a changed result against the reference problems is the
    signal that the format moved.

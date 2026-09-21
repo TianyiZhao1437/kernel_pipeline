@@ -1068,7 +1068,13 @@ def check_benchmark_content(
         traces={},
     )
 
-    config = BenchmarkConfig(
+    # .default() rather than the bare constructor: the bundled eval_config.yaml
+    # is where per-op_type tolerances live, and a definition whose op_type sets
+    # required_matched_ratio there would otherwise be validated at the
+    # compute_error_stats fallback of 1.0 -- bitwise equality -- and fail here
+    # while passing everywhere else. The timing overrides stay short on purpose;
+    # this check is a smoke test, not a measurement.
+    config = BenchmarkConfig.default(
         warmup_runs=2, iterations=5, num_trials=1, definitions=[definition_name]
     )
 
