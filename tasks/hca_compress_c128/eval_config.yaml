@@ -8,7 +8,7 @@
 # every workload and reject all eight mutations. Observed separation:
 #
 #     solution, worst matched_ratio over the sweep   0.99998256
-#     worst mutation, min matched_ratio               0.96282
+#     worst mutation, min matched_ratio               0.900391
 #
 # ---------------------------------------------------------------------------
 # Why bitwise equality is NOT the bar
@@ -21,13 +21,29 @@
 # harmless in itself, but both outputs are then rounded to a low-precision
 # format. Near a rounding boundary that 1e-7 flips the result by a full step:
 #
-#   * ckv (bf16)   -- 48 of 262144 elements differ at total_tokens = 65536,
-#                     always by exactly one bf16 ulp (max abs 7.81e-3).
-#   * ckv_fp8      -- 1 to 4 bytes out of 229376-458752 differ, always by one
-#                     e4m3 code point.
-#   * ckv_scale    -- bitwise identical at every workload. Block absmax and the
-#                     UE8M0 exponent are integer-valued, so they never sit on a
-#                     rounding boundary.
+#   * ckv (bf16)   -- the disagreement is entirely confined to the six
+#                     workloads whose inputs are still `{"type": "random"}`.
+#                     Those are unseeded torch.randn, so the count is a sample
+#                     and not a constant: six runs gave 261-299 differing
+#                     elements. In every one of those runs almost all of them
+#                     are off by exactly one bf16 ulp, with a handful of
+#                     larger steps at elements where ckv cancels toward zero.
+#                     The counts on the other 14 workloads are fixed per run
+#                     but still not equal between runs; what is stable is their
+#                     scale -- single digits against the random half's hundreds
+#                     -- and the reason is that a fixed corpus places far fewer
+#                     values on a rounding boundary than fresh noise does.
+#                     Measured over those 14 (which is where a constant can be
+#                     quoted at all): 9 differing elements in total, being 5 at
+#                     nc=128, 2 at nc=96, and one each at two of the three nc=64
+#                     stress blobs. The largest absolute difference anywhere is
+#                     9.766e-04.
+#   * ckv_fp8      -- the fixed workloads differ in a handful of bytes at most
+#                     (one running of the sweep gave 1); the random ones give
+#                     8-18, always by a single e4m3 code point.
+#   * ckv_scale    -- bitwise identical at every workload, in every run. Block
+#                     absmax and the UE8M0 exponent are integer-valued, so they
+#                     never sit on a rounding boundary.
 #
 # Requiring exact equality would therefore reject correct kernels while
 # rejecting nothing else. The bar has to be a ratio.
@@ -51,11 +67,18 @@
 #
 # rtol = 1e-3 therefore catches a one-exponent error anywhere in the
 # representable range (worst case |e| = 127, rel 7.9e-3, still 8x the bound).
-# The 1e-2 default does not: it covers the observed range comfortably but goes
-# blind above |e| = 100 -- i.e. exactly on the huge-magnitude blocks where a
-# dropped exponent does the most damage. The choice costs nothing: the solution
-# scores 1.00000000 on ckv and ckv_scale at either rtol, and the eight mutations
-# are rejected at either, the floor-instead-of-ceil one at ckv_scale = 0.0089.
+# The choice costs nothing: the solution scores 1.00000000 on ckv and ckv_scale
+# at either rtol, and all eight mutations are rejected at either. Over the full
+# blob-backed sweep the least severe of them is cos/sin swapped at 0.900391
+# (ckv, at num_compressed = 2), and the floor-instead-of-ceil mutation -- which
+# is not a subtle one -- reaches 0.000000 on ckv_fp8 and ckv_scale at
+# num_compressed = 1, where a single block disagrees and there is no ratio left
+# to speak of. Every mutation's worst over the sweep is below 0.961304 at
+# rtol = 1e-3 and identically below it at 1e-2. So the choice is justified by
+# the coverage argument above rather than by anything in this sweep, which is
+# the honest reading: the sweep's exponents span only [-22, -7], well inside the
+# |e| < 100 range where 1e-2 is still sighted. rtol = 1e-3 is what keeps the
+# check sound for inputs this sweep does not contain.
 #
 # (An earlier revision of this file argued for 1e-3 from the opposite premise --
 # that ckv_scale held vLLM's *biased* uint8 byte, making a 1-off a 1/127
@@ -65,20 +88,63 @@
 #
 # atol = 1e-2, deliberately looser than rtol
 #
-# Because the two bounds are ANDed, atol is what absorbs the bf16 ulp noise
-# above: those elements have large relative error but tiny absolute error. With
-# atol = 1e-2 the solution holds matched_ratio = 1.00000000 on ckv across the
-# whole sweep; tightening to 1e-3 drops it to 0.99993896 for no diagnostic gain,
-# since no mutation is detected only in that band.
+# Because the two bounds are ANDed, atol is what allows ordinary low-precision
+# rounding to pass: the elements it forgives have large relative error but tiny
+# absolute error. Measured over the sweep at atol = 1e-2, ckv and ckv_scale never
+# exceed tolerance at any workload (matched_ratio = 1.00000000 for both), and
+# ckv_fp8's worst is 0.99998256, on the deterministic nc=128 workload. Every
+# element that does exceed is a single e4m3 code point, so its absolute error is
+# the step between adjacent e4m3 codes at that magnitude and its relative error
+# is the ratio between that step and the value it sits on: 1.6e+01 (rel 0.111) at
+# nc=1024, 8.0e+00 (rel 0.125) at nc=128, but only 1.95e-03 (rel 0.5) at nc=768,
+# where the two codes are close together. The absolute error tracks the
+# magnitude while the relative error does not, and it is atol that rules on them.
+#
+# Tightening atol to 1e-3 leaves ckv_fp8 essentially where it was -- nc=128 is
+# still 0.99998256 -- but it starts costing on ckv: the largest absolute
+# difference measured on a ckv element anywhere is 9.766e-04, only 2.4% below
+# the tightened bound, so ckv would be riding the threshold with no headroom.
+# That is the whole reason the looser bound is here. It also costs a little on
+# ckv_fp8 at small magnitudes, where the code-point step can itself fall under
+# 1e-2 (nc=768 gains a 1.95e-03 element, nc=1024 a 1.95e-03 one) -- but those
+# two are among the unseeded-random workloads, so the counts there move run to
+# run and are not a constant to quote.
+#
+# Since no mutation is detected only in the 1e-2/1e-3 band -- the least severe
+# lands at 0.900391 at either -- the looser bound costs nothing diagnostically and
+# keeps ckv off the threshold. That is the trade being made here.
 #
 # required_matched_ratio = 0.999
 #
-# Two-sided: 0.00098 of headroom above the solution's worst observation (it
-# could get ~57x noisier and still pass) and 0.036 of margin below the least
-# severe mutation (rejected by a factor of ~37). Note that this ratio applies
-# uniformly to every output, which is acceptable here only because ckv_fp8 is
-# the sensitive one -- the quantisation mutations it catches show up at 0.0098
-# to 0.9628, orders of magnitude clear of the threshold.
+# The threshold sits between the solution's worst observation and the least
+# severe mutation, and both ends were re-measured over the promoted sweep after
+# the blobs were regenerated. Over the 14 blob-backed workloads the solution
+# scores 1.00000000 on ckv and ckv_scale at every workload, and 0.99998256 on
+# ckv_fp8 at num_compressed = 128, which is where the threshold's worst-case
+# margin comes from. That margin is small -- 0.00001744, i.e. 1.7e-5 -- and it
+# is worth being explicit about why it is nonetheless safe. The 0.99998256 is
+# not a near-miss on a semantic difference: it is a single e4m3 code point on
+# one byte of one block, the same rounding-boundary effect described above. It
+# contributes 1 - 0.99998256 = 1.744e-5 of disagreement against a 1e-3
+# allowance, so the solution could drift 57x further before the threshold
+# noticed. The comparison that actually has to discriminate -- a mutation
+# against the solution -- is never closer than 0.900391, leaving 0.098609.
+# What the threshold has to survive is therefore not the solution's noise but
+# the least severe mutation, and that end has three orders of magnitude of room.
+#
+# Earlier revisions quoted this pair as 0.036 / ~37x (the battery's single-
+# synthetic-input figure, which is what the reference test still exercises) and
+# then as 0.099, which was an interpolation rather than a measurement. Both were
+# describing the mutation margin, not the solution margin; the conflation is why
+# they disagreed.
+
+#
+# Note that this ratio applies uniformly to every output, which is acceptable
+# here only because the failures are not marginal: the mutations that the
+# ckv_fp8 comparison is there to catch land anywhere from 0.000000 (UE8M0 floor
+# instead of ceil, which desynchronises nearly every scale byte) to 0.959577
+# (quantisation that skips the bf16 rounding), and every one of the eight is
+# below the threshold at both rtols.
 #
 # ---------------------------------------------------------------------------
 # Input distribution, and what it covers  [measured]
@@ -99,9 +165,10 @@
 #                       states (kurtosis 429 vs 3.0 for a Gaussian)
 #
 # What that bought, measured over the whole sweep. The unit is the 64-element
-# quantisation block -- one UE8M0 exponent each -- and the three stress
-# workloads are counted separately because the clamp coverage comes entirely
-# from one of them:
+# quantisation block -- one UE8M0 exponent each. The last row is the sweep as a
+# whole (11 real + 3 stress), so its 4305-block denominator is the total, not
+# the stress subset; the clamp count in it is `tiny`'s alone, which is why the
+# three stress workloads are also given separately below.
 #
 #                              exponents seen   distinct   clamp(1e-4) hit
 #   randn (before)             [-8, -4]                5   none (0/24913)
@@ -138,22 +205,29 @@
 # controlled test of the claim above -- same shape, same byte count, very
 # different data:
 #
-#   mode      softmax max   e range    triton ms   baseline ms (harness)
-#   real            0.073   [-11, -8]     0.1340          0.5161
-#   flat            0.008   [-11, -9]     0.1337          0.5379
-#   peaked          0.838   [-11, -8]     0.1337          0.5321
-#   tiny            0.076   [-22,-21]     0.1339          0.5168
+#   mode      softmax max   e range    triton ms   ref ms   torch_compile ms
+#   real            0.073   [-11, -8]     0.1337   0.5344            0.1088
+#   flat            0.008   [-11, -9]     0.1338   0.5311            0.1955
+#   peaked          0.838   [-11, -8]     0.1342   0.5381            0.1985
+#   tiny            0.076   [-22,-21]     0.1338   0.5357            0.1955
 #
-# A 100x swing in softmax concentration and a 1e-7 rescale move the Triton
-# kernel's latency by 0.22%, and the PyTorch baseline by 4%. Input values buy
-# correctness coverage here, not performance signal.
+# A 100x swing in softmax concentration moves the Triton kernel's latency by
+# 0.37%. The reference -- which the harness times as the baseline, since
+# profile_baseline is on -- moves by 1.3%, and is the column that matters for
+# the claim being made here: it is the same computation on the same shapes, so
+# any movement in it is data-dependent work or noise, and there is none. Input
+# values buy correctness coverage here, not performance signal.
 #
-# (An earlier revision of this table showed the baseline spanning 0.1166-0.2078
-# ms -- a 1.78x spread that had to be explained away as torch.compile guard
-# state rather than a data effect, since the outlier was `real`, which runs
-# ninth in the sweep while the others run last. That spread did not survive
-# regenerating the blobs: the four now agree to 4% and the ordering artefact is
-# gone. The conclusion is the same one, now without the caveat.)
+# The torch_compile solution is a different story and is listed so the
+# difference is visible rather than aggregated away: its `real` row (which is
+# the sweep's own n=64, the ninth workload to run) is 1.80x faster than the
+# three same-shape rows that follow it. That is the same artefact an earlier
+# revision of this table reported as a 1.78x baseline spread and attributed to
+# torch.compile guard state; it reproduced, so the attribution survives, and
+# what did not survive is the hope that regenerating the blobs would remove it.
+# It is a property of that solution's placement in the run, not of the input --
+# which is exactly why the coverage claim above rests on the reference column
+# and not on this one.
 #
 # Note that the outputs are compared as-is: the evaluator casts ckv_fp8 to
 # float32 and compares the raw e4m3 code points. It does NOT dequantise by

@@ -351,8 +351,10 @@ def test_mutations_leave_margin_below_the_threshold():
     """The threshold has to clear the *least* severe mutation, not the average."""
     best = max(_mutation_ratio(old, new) for _, old, new in MUTATIONS)
     assert best < EVAL.required_matched_ratio
-    # eval_config.yaml quotes this margin as ~0.036; fail if it erodes to
-    # nothing, which would mean the bar is riding on the noise floor.
+    # This runs on one synthetic input; over the 14 blob-backed sweep
+    # workloads eval_config.yaml quotes the margin as 0.098609. Either way the
+    # assertion below only has to stop the bar from eroding to nothing, which
+    # would mean it is riding on the noise floor.
     assert EVAL.required_matched_ratio - best > 0.01, (
         f"only {EVAL.required_matched_ratio - best:.4f} between the threshold and the "
         f"least severe mutation ({best:.6f})"
