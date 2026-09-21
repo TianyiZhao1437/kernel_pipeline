@@ -16,3 +16,13 @@ op_type_config:
     # deliberate semantic mutations (best 0.96282). Derived in
     # tasks/hca_compress_c128/eval_config.yaml.
     required_matched_ratio: 0.999
+    # rtol is tighter than the 1e-2 default because one output, ckv_scale, is an
+    # int8 UE8M0 exponent: a one-exponent error is a factor-of-two error in every
+    # value of its block but shows up as an absolute error of exactly 1, so
+    # detection rests entirely on 1/|e| > rtol. The exponent is representable in
+    # [-22, 120], and 1e-2 goes blind above |e| = 100 -- i.e. precisely on the
+    # huge-magnitude blocks where a dropped exponent does the most damage.
+    # atol stays loose to absorb the one-ulp bf16 noise on ckv, which has large
+    # relative and tiny absolute error. Both derived in the same file.
+    rtol: 1.0e-3
+    atol: 1.0e-2

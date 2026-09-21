@@ -142,9 +142,13 @@
 # torch.compile's guard state, not the inputs (tasks/HCA.md 7.7). Input values
 # buy correctness coverage here, not performance signal.
 #
-# Note that the outputs are compared as-is: the default evaluator casts
-# ckv_fp8 to float32 and compares the raw e4m3 code points. It does NOT
-# dequantise by ckv_scale first.
+# Note that the outputs are compared as-is: the evaluator casts ckv_fp8 to
+# float32 and compares the raw e4m3 code points. It does NOT dequantise by
+# ckv_scale first. That holds for both evaluators this definition can reach --
+# hca_compress routes to LowBitEvaluator, which inherits DefaultEvaluator's
+# comparison and differs only in recording matched_ratio and in supplying a
+# relaxed default when no ratio is configured. Here a ratio is configured, so
+# LowBitEvaluator's 0.95 default never applies.
 #
 # This file is a complete BenchmarkConfig document and is loaded directly:
 #
@@ -154,15 +158,28 @@
 #     # -> rtol=0.001 atol=0.01 required_matched_ratio=0.999
 #     #    warmup_runs=5 iterations=25 num_trials=3 profile_baseline=True
 #
-# Verified against the real API. There is no need to merge these entries into
-# the vendored flashinfer_bench/bench/eval_config.yaml -- which would be a patch
-# of a pinned tree, and is forbidden (third_party/VENDOR.md). Note that
-# `BenchmarkConfig.default()` loads that bundled file instead, so passing this
-# path explicitly is what selects the task's own tolerances.
+# Verified against the real API.
+#
+# The same three tolerances are ALSO carried in the vendored package's bundled
+# flashinfer_bench/bench/eval_config.yaml, keyed on the op_type
+# (third_party/patches/002-hca-compress-eval-routing.patch). That is not
+# redundancy for its own sake: `BenchmarkConfig.default()` loads the bundled
+# file and ignores this one, and `flashinfer-bench validate --checks benchmark`
+# has no way to be handed a config. Without the bundled copy the validator
+# re-scores this definition at the compute_error_stats fallback of 1.0 --
+# bitwise equality -- and fails a kernel that passes everywhere else. The two
+# must be kept in agreement; the derivation lives here, and the bundled entry
+# cites it.
+#
+# (An earlier revision of this comment said merging into the bundled file was
+# forbidden because it patches a pinned tree. The vendoring policy has since
+# been amended: local changes to a vendored tree are legitimate provided they
+# live in third_party/patches/ as a replayable series rather than as an
+# in-place edit a pin bump would silently revert. See third_party/VENDOR.md.)
 #
 # Resolution order is defaults -> op_type_config -> definition_config ->
 # top-level/CLI (flashinfer_bench/bench/config.py), so the definition_config
-# entry below wins over anything keyed on the op_type.
+# entry below wins over the bundled op_type entry when this file is used.
 
 
 definition_config:
