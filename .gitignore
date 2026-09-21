@@ -10,11 +10,16 @@ __pycache__/
 *.egg-info/
 .venv/
 
-# Pipeline state and outputs
-data/
-jobs/
-dist/
-logs/
+# Pipeline state and outputs.
+# Anchored with a leading slash on purpose: an unanchored `data/` also matches
+# nested directories, and it silently swallowed three of them inside the
+# vendored flashinfer-bench tree -- including flashinfer_bench/data/, which
+# holds the Definition/Workload/Solution parsers the whole pipeline validates
+# against. Keep these anchored to the repository root.
+/data/
+/jobs/
+/dist/
+/logs/
 
 # OS
 .DS_Store

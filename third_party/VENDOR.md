@@ -43,10 +43,10 @@ compared against.
 Task format: a **Definition** (op_type, axes, tensor specs, and a plain-PyTorch
 `run` reference as the mathematical specification), a **Workload** (concrete
 values for the variable axes plus input data descriptors), a **Solution**
-(`sources[]`, `spec.language ∈ {python, triton, cpp, cuda}`, `entry_point`,
-`destination_passing_style`), and a **Trace** (the evaluation record with
-`status`, max relative/absolute error, `latency_ms`, `reference_latency_ms`,
-`speedup_factor`, and an environment snapshot).
+(`sources[]`, `spec.language ∈ {python, triton, cpp, cuda, tilelang}`,
+`entry_point`, `destination_passing_style`), and a **Trace** (the evaluation
+record with `status`, max relative/absolute error, `latency_ms`,
+`reference_latency_ms`, `speedup_factor`, and an environment snapshot).
 
 Schemas are authoritative in `docs/flashinfer-trace/{definition,workload,solution,trace}.mdx`.
 Reference parsers live in `flashinfer_bench/data/`. Note that correctness is
@@ -71,6 +71,30 @@ Two:
    `thirdparty/cutlass/README.md` records how to fetch it at the pinned commit.
    Nothing under `flashinfer_bench/` imports CUTLASS at module scope.
 
+### Incomplete-vendoring incident (fixed)
+
+Worth recording, because the failure mode is invisible in a tree diff of what is
+*present*. The repository `.gitignore` carried an unanchored `data/` pattern,
+intended for the pipeline's own output directory. An unanchored pattern matches
+at **any** depth, so it also excluded three directories inside this vendored
+tree:
+
+```
+flashinfer_bench/data/      <- the Definition/Workload/Solution parsers
+tests/data/
+web/apps/web/data/
+```
+
+The tree was therefore committed without the parser package that every task in
+this repository is validated against, and `import flashinfer_bench` failed. The
+`.gitignore` patterns are now anchored to the repository root (`/data/`,
+`/jobs/`, `/dist/`, `/logs/`) and all three directories were restored from the
+pin, verified byte-identical — a restoration back to the pinned state, not a
+patch of a vendored file.
+
+Diagnose the general case with `git check-ignore -v <path>`, which names the
+offending pattern and line.
+
 `web/` (a pnpm/Next.js monorepo, ~1.1 MB of TypeScript) and `.claude/` are kept
 byte-for-byte even though no pipeline code reads them. Removing them would be a
 second, silent deviation from upstream; keeping them means a tree diff against
@@ -93,6 +117,11 @@ newer upstream is an explicit, reviewable commit.
 2. Replace the tree wholesale — never patch a vendored file in place.
 3. Recreate any symlinks the copy does not carry, and re-check `git ls-files -s`
    against the clone for mode `120000` entries.
-4. Update the table above.
-5. Re-run the test suite; a changed result against the reference problems is the
+4. **Verify nothing was silently excluded.** Diff the file list actually staged
+   against the clone — `git ls-files` versus `git -C <clone> ls-files` — rather
+   than trusting that the copy landed. A `.gitignore` pattern matching inside a
+   vendored tree produces a repository that looks complete and is not; see the
+   incident above.
+5. Update the table above.
+6. Re-run the test suite; a changed result against the reference problems is the
    signal that the format moved.
