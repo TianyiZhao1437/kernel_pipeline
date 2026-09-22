@@ -122,6 +122,18 @@ def stage(
         else:
             log(f"  test        {defn.name}  -- none (expected {test_src.relative_to(task_dir)})")
 
+    # The eval config is part of the task, and a benchmark run reads it from the
+    # task directory -- but the validator reads a *dataset*, and has no task
+    # directory to look in. Staging it beside the definitions lets
+    # validate_dataset find it (validate.py prefers ``<root>/eval_config.yaml``
+    # over the copy bundled in the package) so the benchmark check scores
+    # against the tolerances the task is actually run with, instead of the
+    # package's per-op_type entries or the 1.0 fallback.
+    eval_src = task_dir / "eval_config.yaml"
+    if eval_src.is_file():
+        shutil.copy2(eval_src, root / "eval_config.yaml")
+        log(f"  eval_config {eval_src.name}  -> eval_config.yaml")
+
     for path, sol in solutions:
         if sol.definition not in definitions:
             raise SystemExit(

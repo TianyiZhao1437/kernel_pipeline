@@ -1,4 +1,13 @@
 # Credentials
+#
+# models.yaml is the live registry: one entry per model, holding a base URL and
+# an API key. models.example.yaml is the committed template with the schema and
+# placeholder keys -- that is the half a reader gets, and the half that documents
+# what the file is for.
+models.yaml
+#
+# Superseded by models.yaml. Kept ignored so a stray file cannot be committed
+# during the changeover; delete these once no consumer reads them.
 .env*
 
 # Vendored upstream sources are committed deliberately -- see

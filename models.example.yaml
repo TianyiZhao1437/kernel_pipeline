@@ -1,0 +1,52 @@
+# Model registry for the kernel pipeline.
+#
+# Copy to models.yaml and fill in. models.yaml is gitignored -- it holds live
+# API keys, which is why this template is the committed half and that file is
+# not. This replaces the four .env.<model> files, which carried the same two
+# values under seven different variable names each (MODEL_NAME, OPENAI_BASE_URL,
+# OPENAI_API_KEY, BASE_URL, LLM_API_KEY, OPENAI_COMPAT_BASE_URL,
+# OPENAI_COMPAT_API_KEY) with nothing in the repository saying which of the
+# seven any given tool actually read. That was the defect: a model could look
+# configured and still fail, because the file exported the alias the consumer
+# did not use.
+#
+# Keys, per model:
+#
+#   model     (required) the model string sent to the gateway.
+#   base_url  (required) OpenAI-compatible endpoint, including the version path.
+#   api_key   (optional) inline, or leave unset and provide it via the
+#             `api_key_env` variable in the environment.
+#   author    (optional) the `solutions/<author>/` directory to land under.
+#             Defaults to the model name with `.` and `/` replaced by `_`,
+#             which is what the existing trace set uses (qwen3.8-max ->
+#             qwen3_8_max, openai/gpt-6-astra -> gpt_6_astra).
+#
+# A model named on the command line may also be a bare model string that is not
+# in this file, in which case the base_url and key come from the environment
+# (OPENAI_BASE_URL / OPENAI_API_KEY). That keeps the "just point it at a gateway
+# and try" path working without an edit here.
+
+models:
+  claude-opus-5:
+    model: anthropic/claude-opus-5
+    base_url: https://api.commonstack.ai/v1
+    api_key: sk-REPLACE-ME
+    author: claude_opus_5
+
+  gpt-6-astra:
+    model: openai/gpt-6-astra
+    base_url: https://api.commonstack.ai/v1
+    api_key: sk-REPLACE-ME
+    author: gpt_6_astra
+
+  qwen3.8-max:
+    model: qwen3.8-max
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: sk-REPLACE-ME
+    author: qwen3_8_max
+
+  glm-5.1:
+    model: glm-5.1
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: sk-REPLACE-ME
+    author: glm_5_1

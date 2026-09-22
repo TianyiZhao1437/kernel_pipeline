@@ -121,9 +121,26 @@ when it is filed.
 | `001-fp8-nonfinite-check` | `bench/utils.py`, 3 evaluators | `torch.isinf` has no kernel for `float8_e4m3fn` — the format is finite-only, so it has no inf encoding at all. Calling it raises `NotImplementedError`, which surfaces as RUNTIME_ERROR on **every** workload of **any** definition with an fp8 output. Adds `nonfinite_value()`, which upcasts narrow floats (exact: each is a strict subset of float32) and is used at the three call sites that screened tensors this way. |
 | `002-hca-compress-eval-routing` | `bench/evaluators/lowbit.py`, `bench/eval_config.yaml` | Routes `op_type: hca_compress` to `LowBitEvaluator`, which records `matched_ratio` — the quantity this repository's tolerances are derived against — and registers its measured `rtol`/`atol`/`required_matched_ratio` in the bundled per-op_type config. All three must match `tasks/hca_compress_c128/eval_config.yaml`, which is where they are derived: `validate --checks benchmark` reads only the bundled file and cannot be handed the task's, so a tolerance present in one and not the other makes the validator disagree with the runner. Follows upstream's own idiom; `LowBitEvaluator` and `DsaSparseAttentionEvaluator` both hardcode the definitions they claim. |
 | `003-validate-uses-bundled-eval-config` | `data/validate.py` | `check_benchmark_content` built a bare `BenchmarkConfig`, so it never loaded the bundled `eval_config.yaml`. Any definition whose op_type sets a tolerance there was validated at the `compute_error_stats` fallback of 1.0 — bitwise equality — and failed under `validate` while passing under `run`. |
+| `004-validate-prefers-task-eval-config` | `data/validate.py` | 003 made the check read the *bundled* config; this lets it read the *task's*. `check_benchmark_content` takes an `eval_config` argument and `validate_dataset` auto-discovers `<root>/eval_config.yaml`, falling back to the bundled file when there is none. Without it, the only way to make the validator agree with the runner is to copy every task's tolerances into the vendored package — which is exactly what 002 had to do, and which does not scale past one task or survive a pin bump. |
 
-Patch 001 is a plain upstream bug and is the one worth filing first; 003 is
-arguably one too. 002 is this repository's own hook and would be expressed
+Note what 004 means for 002: the `hca_compress` block that 002 adds to the
+bundled `eval_config.yaml` is now redundant for *this* task, because
+`tasks/hca_compress_c128/eval_config.yaml` is staged into the dataset root and
+found there. It is left in place because 002 also does the evaluator routing,
+which is not a tolerance and has no per-task equivalent. A second task would
+need no bundled entry at all.
+
+Verified by tightening, not by inspection — a config that is parsed and then
+ignored is indistinguishable from one that is honored unless a changed value
+changes an outcome. Handing `check_benchmark_content` a copy of the task config
+with `rtol`/`atol` at `1e-12` moves the baseline's measured `matched_ratio` from
+`1.0` to `0.999908`, and additionally requiring `1.0` flips the verdict from
+`ok` to `error (INCORRECT_NUMERICAL)`. Both levers are needed: the baseline
+already hits exactly 1.0 at 14 of the 23 workloads, and the inputs are unseeded
+`torch.randn`, so a ratio bar alone can be cleared by a lucky draw.
+
+Patch 001 is a plain upstream bug and is the one worth filing first; 003 and 004
+are arguably ones too. 002 is this repository's own hook and would be expressed
 differently upstream, since `hca_compress` is not an upstream op_type.
 
 This is a deliberate exception to "never patch a vendored file in place" below,

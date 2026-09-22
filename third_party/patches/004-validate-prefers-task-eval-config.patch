@@ -1,0 +1,111 @@
+diff --git a/flashinfer_bench/data/validate.py b/flashinfer_bench/data/validate.py
+index dd64c25..b551f62 100644
+--- a/flashinfer_bench/data/validate.py
++++ b/flashinfer_bench/data/validate.py
+@@ -1012,6 +1012,7 @@ def check_benchmark_content(
+     workload_traces: list[Trace],
+     baseline_solutions: list[Solution],
+     dataset_root: Path,
++    eval_config: Path | str | None = None,
+ ) -> CheckResult:
+     """Run baseline + reference through Benchmark.run_all and check results.
+ 
+@@ -1027,6 +1028,15 @@ def check_benchmark_content(
+         Baseline solutions to benchmark.
+     dataset_root : Path
+         Dataset root directory (for TraceSet construction).
++    eval_config : Path | str | None
++        BenchmarkConfig YAML to score against. ``None`` falls back to the
++        eval_config.yaml bundled with this package, which carries only the
++        per-op_type entries that shipped upstream. A definition whose
++        tolerances live in its own file -- the normal case for a task authored
++        outside this package -- is then scored at whatever the bundled
++        op_type entry says, or at the 1.0 fallback if there is none, and the
++        check can disagree with the benchmark the task is actually run with.
++        Pass the task's own file to make the two agree.
+ 
+     Returns
+     -------
+@@ -1074,9 +1084,24 @@ def check_benchmark_content(
+     # compute_error_stats fallback of 1.0 -- bitwise equality -- and fail here
+     # while passing everywhere else. The timing overrides stay short on purpose;
+     # this check is a smoke test, not a measurement.
+-    config = BenchmarkConfig.default(
+-        warmup_runs=2, iterations=5, num_trials=1, definitions=[definition_name]
+-    )
++    #
++    # `eval_config`, when given, is the task's own file and takes precedence
++    # over the bundled one. That is what makes this check agree with the run
++    # the task is actually judged by: a task authored outside this package
++    # keeps its tolerances in its own eval_config.yaml, and the bundled file
++    # cannot know them.
++    if eval_config is not None:
++        config = BenchmarkConfig.from_yaml(
++            str(eval_config),
++            warmup_runs=2,
++            iterations=5,
++            num_trials=1,
++            definitions=[definition_name],
++        )
++    else:
++        config = BenchmarkConfig.default(
++            warmup_runs=2, iterations=5, num_trials=1, definitions=[definition_name]
++        )
+ 
+     try:
+         benchmark = Benchmark(trace_set, config)
+@@ -1135,6 +1160,7 @@ def validate_dataset(
+     disable_gpu: bool = False,
+     output_folder: Optional[str] = None,
+     outputs: Optional[list[Literal["stdout", "json", "text"]]] = None,
++    eval_config: Optional[str] = None,
+ ) -> DatasetReport:
+     """Validate a FlashInfer Trace dataset and produce a report.
+ 
+@@ -1155,6 +1181,15 @@ def validate_dataset(
+         Report output folder. Defaults to ``<dataset>/reports/``.
+     outputs : Optional[list[Literal["stdout", "json", "text"]]]
+         Output targets. Defaults to ``["stdout", "json", "text"]``.
++    eval_config : Optional[str]
++        BenchmarkConfig YAML for the ``benchmark`` check to score against.
++        Defaults to ``<dataset>/eval_config.yaml`` when that file exists,
++        otherwise the copy bundled with this package. See
++        ``check_benchmark_content`` for why the distinction matters: the
++        bundled file carries only upstream's per-op_type entries, so a
++        definition whose tolerances live in its own config would be scored at
++        the wrong ratio and could be reported as failing while the benchmark it
++        is actually run with passes it.
+ 
+     Returns
+     -------
+@@ -1169,6 +1204,16 @@ def validate_dataset(
+     if not dataset_root.is_dir():
+         raise FileNotFoundError(f"dataset root does not exist: {dataset_root}")
+ 
++    # Resolve the benchmark check's eval config once, before the per-definition
++    # loop. A root that carries its own config gets it; a root that does not
++    # falls through to the bundled copy, which is what this check has always
++    # used. Existence is checked, not inferred from the discovery layout: the
++    # validator finds content by path depth, and eval_config.yaml is not part
++    # of that layout.
++    if eval_config is None:
++        candidate = dataset_root / "eval_config.yaml"
++        eval_config = str(candidate) if candidate.is_file() else None
++
+     if checks is None:
+         checks = CPU_CHECKS if disable_gpu else ALL_CHECKS
+     for check in checks:
+@@ -1279,7 +1324,12 @@ def validate_dataset(
+                     if e.author == "baseline" and e.solution is not None
+                 ]
+                 report.benchmark = check_benchmark_content(
+-                    definition_name, definition, workload_traces, baseline_solutions, dataset_root
++                    definition_name,
++                    definition,
++                    workload_traces,
++                    baseline_solutions,
++                    dataset_root,
++                    eval_config=eval_config,
+                 )
+ 
+         report.status = compute_definition_status(report)
