@@ -223,9 +223,12 @@ The top of the sweep is not arbitrary. vLLM's V4 path derives
 the largest context the model is configured for, so it measured the middle of
 the range and called it the range. 2048/4096/8192 close that. They are also
 where the two shipped solutions stop being comparable: claude's kernel plateaus
-at a flat ~221 GB/s (4.6% of the H200's 4800 GB/s peak) from `nc=384` up, while
-the qwen kernel climbs to ~1963 GB/s (40.9%) — a factor of 8.9 at the top of the
-sweep that the truncated sweep could not see at all.
+at a flat ~600 GB/s (14.2% of this H200's measured 4218 GB/s peak) from `nc=512`
+up, while the qwen kernel keeps climbing to ~1988 GB/s (47.1%) — a factor of 3.3
+at the top of the sweep that the truncated sweep could not see at all. (The
+earlier revision of this paragraph attributed the seed solution's 221 GB/s and
+the spec sheet's 4800 GB/s to claude's kernel; neither was its number. Corrected
+against `tools/roofline.py`.)
 
 The plan insisted the sweep must include **`total_tokens` not divisible by 128**,
 as "where real implementations break". **That is now structurally impossible**,

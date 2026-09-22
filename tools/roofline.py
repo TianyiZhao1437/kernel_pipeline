@@ -32,6 +32,11 @@ tasks/hca_compress_c128/bytes_model.py for the case that motivated the hook.
 Without it the footprint is an over-count, so the reported bandwidth is a lower
 bound and the kernel looks better than it is.
 
+A model may take a third argument, ``solution``, if some solutions move traffic
+the Definition cannot describe -- an fp32 buffer staged between two kernels, for
+instance. This tool inspects the signature and passes the solution name when the
+model accepts it, so a model that only needs the axes keeps working unchanged.
+
 Usage:
     python3 tools/roofline.py tasks/hca_compress_c128
     python3 tools/roofline.py tasks/hca_compress_c128 --root data/trace_sets/other
@@ -39,6 +44,7 @@ Usage:
 
 import argparse
 import importlib.util
+import inspect
 import json
 import pathlib
 import sys
@@ -83,7 +89,14 @@ def load_bytes_model(task_dir: pathlib.Path):
     spec = importlib.util.spec_from_file_location(f"{task_dir.name}_bytes_model", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.streamed_bytes, f"streamed footprint ({path})"
+    fn = mod.streamed_bytes
+    # A bytes model may take the solution name as a third argument, to account
+    # for traffic the Definition cannot describe -- an fp32 buffer staged
+    # between two kernels, say. `declared_bytes` does not, and neither do older
+    # models, so dispatch on the signature instead of forcing every task to
+    # grow a parameter it has no use for.
+    takes_solution = len(inspect.signature(fn).parameters) >= 3
+    return fn, f"streamed footprint ({path})", takes_solution
 
 
 def measure_peak_bandwidth(gib: float = 0.5, iters: int = 50) -> float:
@@ -115,7 +128,7 @@ def main():
     from flashinfer_bench.data import TraceSet
 
     trace_set = TraceSet.from_path(str(root))
-    bytes_of, model_desc = load_bytes_model(args.task_dir)
+    bytes_of, model_desc, bytes_take_solution = load_bytes_model(args.task_dir)
 
     peak = args.peak if args.peak is not None else measure_peak_bandwidth()
     import torch
@@ -144,7 +157,11 @@ def main():
             rows = []
             for t in sol_traces:
                 axes = t.workload.axes
-                nbytes = bytes_of(definition, axes)
+                nbytes = (
+                    bytes_of(definition, axes, sol_name)
+                    if bytes_take_solution
+                    else bytes_of(definition, axes)
+                )
                 ms = t.evaluation.performance.latency_ms
                 gbs = nbytes / 1e9 / (ms / 1e3)
                 roof_ms = nbytes / (peak * 1e9) * 1e3
