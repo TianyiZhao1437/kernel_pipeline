@@ -9,7 +9,7 @@ import torch
 from typing_extensions import override
 
 from flashinfer_bench.bench.config import ResolvedEvalConfig
-from flashinfer_bench.bench.utils import compute_error_stats, make_eval
+from flashinfer_bench.bench.utils import compute_error_stats, make_eval, nonfinite_value
 from flashinfer_bench.compile import Runnable
 from flashinfer_bench.data import Correctness, Definition, Evaluation, EvaluationStatus
 
@@ -88,11 +88,7 @@ class DsaSparseAttentionEvaluator(DefaultEvaluator):
                         status=EvaluationStatus.INCORRECT_DTYPE, device=device, log_path=log_path
                     )
 
-                non_finite_err_val = None
-                if torch.isinf(sol_tensor).any().item():
-                    non_finite_err_val = float("inf")
-                elif torch.isnan(sol_tensor).any().item():
-                    non_finite_err_val = float("nan")
+                non_finite_err_val = nonfinite_value(sol_tensor)
 
                 if non_finite_err_val is not None:
                     correctness = Correctness(

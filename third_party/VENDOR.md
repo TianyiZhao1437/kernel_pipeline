@@ -7,6 +7,10 @@ Two upstream trees live under this directory, both as pinned copies:
 | `KernelBench/` | `https://github.com/ScalingIntelligence/KernelBench` | `423217d9fda91e0c2d67e4a43bf62f96f6d104f1` | 2026-03-05 |
 | `flashinfer-bench/` | `https://github.com/flashinfer-ai/flashinfer-bench` | `40e6ca7844b514eb4b1c7edba6d6a7377df57870` | 2026-04-30 |
 
+`flashinfer-bench/` is a copy of upstream at that commit **plus** the local patch
+series below. The installed dependency is not this tree — see
+[What is actually installed](#what-is-actually-installed).
+
 ---
 
 ## `KernelBench/`
@@ -43,10 +47,10 @@ compared against.
 Task format: a **Definition** (op_type, axes, tensor specs, and a plain-PyTorch
 `run` reference as the mathematical specification), a **Workload** (concrete
 values for the variable axes plus input data descriptors), a **Solution**
-(`sources[]`, `spec.language ∈ {python, triton, cpp, cuda}`, `entry_point`,
-`destination_passing_style`), and a **Trace** (the evaluation record with
-`status`, max relative/absolute error, `latency_ms`, `reference_latency_ms`,
-`speedup_factor`, and an environment snapshot).
+(`sources[]`, `spec.language ∈ {python, triton, cpp, cuda, tilelang}`,
+`entry_point`, `destination_passing_style`), and a **Trace** (the evaluation
+record with `status`, max relative/absolute error, `latency_ms`,
+`reference_latency_ms`, `speedup_factor`, and an environment snapshot).
 
 Schemas are authoritative in `docs/flashinfer-trace/{definition,workload,solution,trace}.mdx`.
 Reference parsers live in `flashinfer_bench/data/`. Note that correctness is
@@ -71,12 +75,99 @@ Two:
    `thirdparty/cutlass/README.md` records how to fetch it at the pinned commit.
    Nothing under `flashinfer_bench/` imports CUTLASS at module scope.
 
+### Incomplete-vendoring incident (fixed)
+
+Worth recording, because the failure mode is invisible in a tree diff of what is
+*present*. The repository `.gitignore` carried an unanchored `data/` pattern,
+intended for the pipeline's own output directory. An unanchored pattern matches
+at **any** depth, so it also excluded three directories inside this vendored
+tree:
+
+```
+flashinfer_bench/data/      <- the Definition/Workload/Solution parsers
+tests/data/
+web/apps/web/data/
+```
+
+The tree was therefore committed without the parser package that every task in
+this repository is validated against, and `import flashinfer_bench` failed. The
+`.gitignore` patterns are now anchored to the repository root (`/data/`,
+`/jobs/`, `/dist/`, `/logs/`) and all three directories were restored from the
+pin, verified byte-identical — a restoration back to the pinned state, not a
+patch of a vendored file.
+
+Diagnose the general case with `git check-ignore -v <path>`, which names the
+offending pattern and line.
+
 `web/` (a pnpm/Next.js monorepo, ~1.1 MB of TypeScript) and `.claude/` are kept
 byte-for-byte even though no pipeline code reads them. Removing them would be a
 second, silent deviation from upstream; keeping them means a tree diff against
 the pin is meaningful.
 
 ---
+
+### Patches (`third_party/patches/`)
+
+The vendored tree carries three local patches, and the fork carries the same
+three as one commit (`19acd0df4a4a3c456db034f4e6c9defc21d91c40` on branch
+`hca-integration`) — see [What is actually installed](#what-is-actually-installed).
+They are kept here as a numbered series as well, so that a pin bump — which
+replaces the tree wholesale and therefore discards them — can replay them with
+`third_party/patches/apply.sh`, and so that each one maps 1:1 to an upstream PR
+when it is filed.
+
+| Patch | Touches | Why |
+|---|---|---|
+| `001-fp8-nonfinite-check` | `bench/utils.py`, 3 evaluators | `torch.isinf` has no kernel for `float8_e4m3fn` — the format is finite-only, so it has no inf encoding at all. Calling it raises `NotImplementedError`, which surfaces as RUNTIME_ERROR on **every** workload of **any** definition with an fp8 output. Adds `nonfinite_value()`, which upcasts narrow floats (exact: each is a strict subset of float32) and is used at the three call sites that screened tensors this way. |
+| `002-hca-compress-eval-routing` | `bench/evaluators/lowbit.py`, `bench/eval_config.yaml` | Routes `op_type: hca_compress` to `LowBitEvaluator`, which records `matched_ratio` — the quantity this repository's tolerances are derived against — and registers its measured `rtol`/`atol`/`required_matched_ratio` in the bundled per-op_type config. All three must match `tasks/hca_compress_c128/eval_config.yaml`, which is where they are derived: `validate --checks benchmark` reads only the bundled file and cannot be handed the task's, so a tolerance present in one and not the other makes the validator disagree with the runner. Follows upstream's own idiom; `LowBitEvaluator` and `DsaSparseAttentionEvaluator` both hardcode the definitions they claim. |
+| `003-validate-uses-bundled-eval-config` | `data/validate.py` | `check_benchmark_content` built a bare `BenchmarkConfig`, so it never loaded the bundled `eval_config.yaml`. Any definition whose op_type sets a tolerance there was validated at the `compute_error_stats` fallback of 1.0 — bitwise equality — and failed under `validate` while passing under `run`. |
+
+Patch 001 is a plain upstream bug and is the one worth filing first; 003 is
+arguably one too. 002 is this repository's own hook and would be expressed
+differently upstream, since `hca_compress` is not an upstream op_type.
+
+This is a deliberate exception to "never patch a vendored file in place" below,
+taken because the alternative — the out-of-tree evaluator shim this replaced —
+made the emitted TraceSet unusable by anyone running the stock CLI. The property
+that rule protects (reproducible, reviewable upgrades) is preserved by keeping
+the patches reviewable and replayable rather than by having none.
+
+## What is actually installed
+
+The tree above is the **reference**, not the import. `pyproject.toml` binds the
+`flashinfer-bench` name to this project's fork at a pinned commit:
+
+| Installed from | Revision | Which is |
+|---|---|---|
+| `https://github.com/TianyiZhao1437/flashinfer-bench` | `19acd0df4a4a3c456db034f4e6c9defc21d91c40` | upstream `40e6ca7` + the three patches above, as one commit |
+
+So the same local changes exist twice, for different purposes:
+
+- **on the fork**, because that is what `pip` fetches — it is what the
+  interpreter imports, what the `flashinfer-bench` CLI runs, and what the
+  benchmark runner's worker subprocesses re-import in their own interpreters;
+- **in the tree plus `patches/`**, because that is what a reviewer can diff
+  against upstream and what survives a pin bump.
+
+Neither is derived from the other at install time. They agree by construction,
+and that is the invariant to check after touching either:
+
+```
+# the four files the patches touch must be identical in both
+for f in bench/utils.py bench/evaluators/lowbit.py bench/eval_config.yaml \
+         data/validate.py; do
+  cmp third_party/flashinfer-bench/flashinfer_bench/$f \
+      <fork-checkout>/flashinfer_bench/$f || echo "DRIFT: $f"
+done
+```
+
+Drift matters more here than for a typical vendored dependency, because
+`tools/gen_solution_llm.py` reads its prompts and its `KernelGenerator` from
+`third_party/flashinfer-bench/examples/` while driving the **installed** library.
+`examples/` is not part of the installed package — the fork's `pyproject.toml`
+declares package-data for `py.typed` and the CUTLASS headers only — so the two
+sources are genuinely separate halves that have to keep agreeing about the
+solution format.
 
 ## Why a copy and not a submodule
 
@@ -90,9 +181,20 @@ newer upstream is an explicit, reviewable commit.
 ## Updating a pin
 
 1. Clone upstream at the new commit into a temporary directory.
-2. Replace the tree wholesale — never patch a vendored file in place.
+2. Replace the tree wholesale — never patch a vendored file in place. Local
+   changes live in `third_party/patches/` as a replayable series, never as an
+   edit that the next bump would silently revert.
 3. Recreate any symlinks the copy does not carry, and re-check `git ls-files -s`
    against the clone for mode `120000` entries.
-4. Update the table above.
-5. Re-run the test suite; a changed result against the reference problems is the
+4. **Verify nothing was silently excluded.** Diff the file list actually staged
+   against the clone — `git ls-files` versus `git -C <clone> ls-files` — rather
+   than trusting that the copy landed. A `.gitignore` pattern matching inside a
+   vendored tree produces a repository that looks complete and is not; see the
+   incident above.
+5. Re-apply the patch series: `third_party/patches/apply.sh`. A rejected hunk is
+   information — upstream moved the code the patch depends on, or fixed it. Drop
+   the patch if upstream fixed it; otherwise reread upstream rather than forcing
+   it. The script is idempotent and skips patches already present.
+6. Update the table above.
+7. Re-run the test suite; a changed result against the reference problems is the
    signal that the format moved.

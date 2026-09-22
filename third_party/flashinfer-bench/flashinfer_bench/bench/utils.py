@@ -93,6 +93,30 @@ def normalize_outputs(
     )
 
 
+def nonfinite_value(t: torch.Tensor) -> Optional[float]:
+    """Return ``inf`` or ``nan`` if ``t`` holds any, else ``None``.
+
+    ``torch.isinf`` has no kernel for ``float8_e4m3fn``. That is not an
+    oversight: the ``fn`` suffix means finite-only, so the format has no inf
+    encoding and the answer is trivially False. Calling it anyway raises
+    ``NotImplementedError``, which surfaces as a RUNTIME_ERROR on every workload
+    of any definition with a float8_e4m3fn output. ``torch.isnan`` happens to be
+    implemented, so the failure is asymmetric and does not look like a dtype
+    problem.
+
+    Upcasting narrow floats to float32 is exact -- every float8 and float4
+    format is a strict subset of float32's range and precision -- so inf/nan
+    classification is unchanged for the dtypes that already worked.
+    """
+    if t.is_floating_point() and t.element_size() < 2:
+        t = t.to(torch.float32)
+    if torch.isinf(t).any().item():
+        return float("inf")
+    if torch.isnan(t).any().item():
+        return float("nan")
+    return None
+
+
 def compute_error_stats(
     output: torch.Tensor, reference: torch.Tensor, cfg: ResolvedEvalConfig
 ) -> Tuple[float, float, bool, float]:

@@ -1,0 +1,12 @@
+{
+  "name": "glm-5.1_hca_compress_c128_h512_r64_triton_optimized_r10_c0",
+  "author": "glm-5.1",
+  "model": "glm-5.1",
+  "entry_point": "main.py::run",
+  "target_hardware": [
+    "H200"
+  ],
+  "language": "SupportedLanguages.TRITON",
+  "description": "glm-5.1 optimized kernel for hca_compress_c128_h512_r64 (round 10, candidate 0)",
+  "rounds": 10
+}

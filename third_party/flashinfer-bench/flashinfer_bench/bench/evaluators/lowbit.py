@@ -9,7 +9,7 @@ import torch
 from typing_extensions import override
 
 from flashinfer_bench.bench.config import ResolvedEvalConfig
-from flashinfer_bench.bench.utils import compute_error_stats, make_eval
+from flashinfer_bench.bench.utils import compute_error_stats, make_eval, nonfinite_value
 from flashinfer_bench.compile import Runnable
 from flashinfer_bench.data import Correctness, Definition, Evaluation, EvaluationStatus
 
@@ -23,7 +23,10 @@ class LowBitEvaluator(DefaultEvaluator):
     @override
     @classmethod
     def can_evaluate(cls, definition: Definition) -> bool:
-        return "moe_fp8_block_scale" in definition.name
+        # hca_compress emits fp8 with a UE8M0 scale per 64 elements, so it is a
+        # low-bit op in exactly the sense this evaluator exists for: what matters
+        # is the fraction of output codes that match, not a max-error bound.
+        return "moe_fp8_block_scale" in definition.name or definition.op_type == "hca_compress"
 
     @override
     @classmethod
@@ -79,11 +82,7 @@ class LowBitEvaluator(DefaultEvaluator):
                         status=EvaluationStatus.INCORRECT_DTYPE, device=device, log_path=log_path
                     )
 
-                non_finite_err_val: Optional[float] = None
-                if torch.isinf(sol_tensor).any().item():
-                    non_finite_err_val = float("inf")
-                elif torch.isnan(sol_tensor).any().item():
-                    non_finite_err_val = float("nan")
+                non_finite_err_val: Optional[float] = nonfinite_value(sol_tensor)
 
                 if non_finite_err_val is not None:
                     correctness = Correctness(
