@@ -66,6 +66,30 @@ def extract_code(text: str, language: str = "triton") -> str:
     last = len(lines) - 1
     while last > first and not lines[last].strip():
         last -= 1
+
+    # A model that narrates its way through a fix may abandon one attempt
+    # mid-file ("Wait, I realize ... is redundant") and start a second one
+    # below. Keeping both leaves prose in the middle of the source and fails as
+    # a syntax error at a line that looks unrelated. The first attempt is the
+    # one to keep: it is the complete one, and the round's evaluation feedback
+    # is what tells the model the second one was ever wanted.
+    cut = None
+    for i, ln in enumerate(lines[first:last + 1], first):
+        st = ln.strip()
+        if not st:
+            continue
+        if st.startswith(("Wait,", "Wait ", "Actually,", "Hmm", "python", "```")):
+            cut = i
+            break
+    if cut is not None:
+        tail = "\n".join(lines[cut:last + 1])
+        if not re.search(r"^\s*(import |from |def |@|class )", tail, re.M):
+            cut = None  # the "prose" was the last thing; keep it for the error
+    if cut is not None:
+        last = cut - 1
+        while last > first and not lines[last].strip():
+            last -= 1
+
     return "\n".join(lines[first:last + 1]).rstrip() + "\n"
 
 
