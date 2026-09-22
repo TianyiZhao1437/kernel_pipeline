@@ -7,9 +7,11 @@ Usage:
 """
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 
@@ -18,9 +20,53 @@ GEN_DIR = REPO / "third_party/flashinfer-bench/examples/kernel_generator"
 sys.path.insert(0, str(GEN_DIR))
 sys.path.insert(0, str(REPO / "tools"))
 
+# A hang inside the generator is otherwise invisible: ptrace is blocked in this
+# container, so gdb/py-spy cannot attach. faulthandler dumps every thread's stack
+# from inside the process on a timer, which is the only stack we can get.
+if os.environ.get("GEN_FAULT_AFTER"):
+    import faulthandler
+    faulthandler.dump_traceback_later(float(os.environ["GEN_FAULT_AFTER"]), exit=True)
+
 TASK = REPO / "tasks/hca_compress_c128"
 DEF_NAME = "hca_compress_c128_h512_r64"
 ROOT = REPO / "data/trace_sets/hca_c128_v4"
+
+
+def extract_code(text: str, language: str = "triton") -> str:
+    """Pull the kernel source out of a reply that may be mostly prose.
+
+    KernelGenerator's own _clean_generated_code only strips a fence when the
+    reply *starts* with one. glm-5.1 does not write that way: it narrates the
+    error it is fixing, then opens a fence several lines in, so every round came
+    back with the prose and the bare "```python" line still attached and died as
+    "unterminated string literal". Each round's failure is therefore reported
+    against source that was never code.
+
+    A fenced block is preferred when present. Otherwise the reply is cut from
+    its first code-looking line to its last, which is what a model that answers
+    with a preamble and no fence leaves behind.
+    """
+    if not text:
+        return text
+
+    m = re.search(r"```(?:python|py|triton)?[ \t]*\n(.*?)```", text, re.DOTALL)
+    if m and m.group(1).strip():
+        return m.group(1).strip("\n") + "\n"
+
+    if "```" in text:
+        # An unterminated fence (a truncated reply): take everything after it.
+        head, _, tail = text.partition("```")
+        tail = re.sub(r"^[a-zA-Z0-9_+-]*[ \t]*\n", "", tail, count=1)
+        if tail.strip():
+            return tail.strip("\n") + "\n"
+
+    lines = text.splitlines()
+    code_starts = ("import ", "from ", "def ", "@", "class ", "#")
+    first = next((i for i, ln in enumerate(lines) if ln.startswith(code_starts)), 0)
+    last = len(lines) - 1
+    while last > first and not lines[last].strip():
+        last -= 1
+    return "\n".join(lines[first:last + 1]).rstrip() + "\n"
 
 
 def load_env(path: pathlib.Path) -> None:
@@ -46,6 +92,15 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--max-tokens", type=int, default=16384)
     ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument("--stream", action="store_true",
+                    help="accumulate a streamed response instead of waiting for "
+                         "one buffered body; needed for gateways that hold a long "
+                         "reasoning reply open past their own idle timeout")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="ask the gateway to skip its reasoning pass (glm-5.1: "
+                         "extra_body {\"thinking\": {\"type\": \"disabled\"}}, which "
+                         "was measured to take completion reasoning from 149 tokens "
+                         "to 0). Trades capability for a much shorter request.")
     args = ap.parse_args()
 
     load_env(args.env)
@@ -61,47 +116,129 @@ def main() -> int:
 
     _real = openai.AsyncOpenAI
 
+    # The client is patched by subclassing rather than by intercepting attribute
+    # access. An earlier version hooked __getattr__ on the client and walked
+    # chat -> completions -> create, which silently did nothing: `chat` is a
+    # cached_property on AsyncOpenAI, so ordinary lookup finds it and
+    # __getattr__ is never consulted. The result was that timeout and
+    # max_retries applied (they are set in __init__, which is called normally)
+    # while every per-call injection -- max_tokens, max_completion_tokens,
+    # thinking, and stream -- was discarded, so the driver sent a buffered
+    # request with reasoning on and no token ceiling. That is the configuration
+    # this file exists to avoid. Overriding create on the real Completions class
+    # cannot be bypassed that way, and _assert_patch_applied below re-checks it.
+    _inject_stats = {"calls": 0}
+
+    def _inject(kw):
+        _inject_stats["calls"] += 1
+        # Both names are set: the two gateways disagree on which one bounds the
+        # visible output (measured -- glm counts reasoning outside the budget,
+        # qwen counts it inside), and a value this high truncates under neither.
+        kw.setdefault("max_tokens", args.max_tokens)
+        kw.setdefault("max_completion_tokens", args.max_tokens)
+        if args.no_thinking:
+            body = dict(kw.get("extra_body") or {})
+            body.setdefault("thinking", {"type": "disabled"})
+            kw["extra_body"] = body
+        if args.stream:
+            kw["stream"] = True
+        return kw
+
+    _real_create = openai.resources.chat.completions.AsyncCompletions.create
+
+    async def _patient_create(self, *a, **kw):
+        _inject(kw)
+        n = _inject_stats["calls"]
+        if kw.get("stream"):
+            return await _accumulate(await _real_create(self, *a, **kw), f"#{n}")
+        return await _real_create(self, *a, **kw)
+
     class _PatientAsyncOpenAI(_real):  # type: ignore[misc,valid-type]
         def __init__(self, *a, **kw):
             kw.setdefault("timeout", args.timeout)
             kw.setdefault("max_retries", args.retries)
             super().__init__(*a, **kw)
+            # Replace the already-constructed completions resource, since the
+            # cached_property that builds it runs inside the base __init__.
+            self.chat.completions = _PatchedCompletions(
+                self.chat.completions._client
+            )
 
-        def __getattr__(self, item):
-            # chat -> completions -> create(**_inject)
-            if item != "chat":
-                return super().__getattr__(item)
-            chat = super().__getattr__(item)
+    _PatchedCompletions = type(
+        "_PatchedCompletions",
+        (openai.resources.chat.completions.AsyncCompletions,),
+        {"create": _patient_create},
+    )
 
-            class _Chat:
-                def __getattr__(self, sub):
-                    if sub != "completions":
-                        return getattr(chat, sub)
-                    comp = getattr(chat, sub)
+    def _assert_patch_applied():
+        """Fail loudly rather than fall back to the stalling configuration."""
+        probe = _PatientAsyncOpenAI(api_key="unused", base_url="http://127.0.0.1:1/v1")
+        assert isinstance(probe.chat.completions, _PatchedCompletions), (
+            "completions patch did not apply; the generator would send a buffered "
+            "request and this run would stall"
+        )
+        assert probe.timeout == args.timeout, "timeout patch did not apply"
+        return True
 
-                    class _Completions:
-                        def __getattr__(self, name):
-                            fn = getattr(comp, name)
-                            if name != "create":
-                                return fn
+    async def _accumulate(stream, _label=""):
+        """Turn an async chunk stream into the ChatCompletion the caller wants.
 
-                            def wrapped(*a, **kw):
-                                # Both names are set: the two gateways disagree
-                                # on which one bounds the visible output
-                                # (measured -- glm counts reasoning outside the
-                                # budget, qwen counts it inside), and a value
-                                # this high truncates under neither.
-                                kw.setdefault("max_tokens", args.max_tokens)
-                                kw.setdefault("max_completion_tokens", args.max_tokens)
-                                return fn(*a, **kw)
+        KernelGenerator reads response.choices[0].message.content, which a
+        stream does not carry, so the chunks are concatenated back into one
+        object of the shape it expects. We stream because a gateway that
+        buffers a long reasoning response can sit silent for >15 minutes and
+        drop the connection; with a stream, bytes flow the whole time.
+        """
+        from openai.types.chat import ChatCompletion
 
-                            return wrapped
+        import time
+        t0 = time.time()
+        chunks, last = [], None
+        async for ch in (await stream if inspect.isawaitable(stream) else stream):
+            if not chunks:
+                print(f"  [stream{_label}] first chunk at {time.time()-t0:.1f}s", flush=True)
+            chunks.append(ch)
+            last = ch
+        if last is None:
+            raise RuntimeError("stream produced no chunks")
+        print(f"  [stream{_label}] done: {len(chunks)} chunks in {time.time()-t0:.1f}s", flush=True)
 
-                    return _Completions()
+        content, reasoning, tool_calls = [], [], []
+        for ch in chunks:
+            if not ch.choices:
+                continue
+            d = ch.choices[0].delta
+            if d is None:
+                continue
+            if getattr(d, "content", None):
+                content.append(d.content)
+            if getattr(d, "reasoning_content", None):
+                reasoning.append(d.reasoning_content)
+            for tc in getattr(d, "tool_calls", None) or []:
+                tool_calls.append(tc)
 
-            return _Chat()
+        done = chunks[-1]
+        usage = next((c.usage for c in reversed(chunks) if getattr(c, "usage", None)), None)
+        msg = {
+            "role": "assistant",
+            "content": "".join(content) or None,
+            "reasoning_content": "".join(reasoning) or None,
+        }
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return ChatCompletion.model_construct(
+            id=done.id, choices=[{
+                "index": 0,
+                "message": msg,
+                "finish_reason": done.choices[0].finish_reason if done.choices else "stop",
+                "logprobs": None,
+            }],
+            created=done.created, model=done.model, object="chat.completion",
+            usage=usage,
+        )
 
     openai.AsyncOpenAI = _PatientAsyncOpenAI
+    _assert_patch_applied()
 
     from kernel_generator import KernelGenerator
     from flashinfer_bench import TraceSet
@@ -115,6 +252,11 @@ def main() -> int:
     scratch = REPO / "data" / "trace_sets" / f"_gen_{args.author}"
     if not (scratch / "definitions").is_dir():
         shutil.copytree(ROOT, scratch, dirs_exist_ok=True)
+    # Start from an empty trace set each run: an earlier attempt's traces would
+    # otherwise be inherited and read back as if this run had produced them.
+    for author_dir in (scratch / "traces").glob("*"):
+        for f in author_dir.rglob("*.jsonl"):
+            f.write_text("")
     trace_set = TraceSet.from_path(str(scratch))
     print(f"generator trace root: {scratch.relative_to(REPO)} (a copy of {ROOT.name})", flush=True)
     definition = trace_set.definitions[DEF_NAME]
@@ -129,6 +271,22 @@ def main() -> int:
         base_url=os.environ["BASE_URL"],
         use_ffi=False,
     )
+
+    # KernelGenerator's own fence stripping only fires when the reply begins with
+    # a fence, which is not how every model answers. Wrap the per-round code
+    # extraction so the source that is actually built and evaluated has had the
+    # surrounding prose removed. Applied to the instance, so third_party/ stays
+    # as pinned.
+    _raw_codegen = gen._generate_code_from_prompt
+
+    async def _codegen(prompt):
+        result = await _raw_codegen(prompt)
+        cleaned = extract_code(result.get("cleaned") or "", "triton")
+        if cleaned != result.get("cleaned"):
+            result["cleaned"] = cleaned
+        return result
+
+    gen._generate_code_from_prompt = _codegen
 
     solution = gen.generate(trace_set=trace_set, definition=definition, gen_rounds=args.rounds)
     print(f"\ngenerated solution {solution.name} (author {solution.author})", flush=True)
