@@ -1,0 +1,12 @@
+{
+  "name": "anthropic/claude-opus-5_hca_compress_c128_h512_r64_triton_optimized_r3_c0",
+  "author": "anthropic/claude-opus-5",
+  "model": "anthropic/claude-opus-5",
+  "entry_point": "main.py::run",
+  "target_hardware": [
+    "H200"
+  ],
+  "language": "SupportedLanguages.TRITON",
+  "description": "anthropic/claude-opus-5 optimized kernel for hca_compress_c128_h512_r64 (round 3, candidate 0)",
+  "rounds": 10
+}

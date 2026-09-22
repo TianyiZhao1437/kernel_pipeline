@@ -7,6 +7,10 @@ Two upstream trees live under this directory, both as pinned copies:
 | `KernelBench/` | `https://github.com/ScalingIntelligence/KernelBench` | `423217d9fda91e0c2d67e4a43bf62f96f6d104f1` | 2026-03-05 |
 | `flashinfer-bench/` | `https://github.com/flashinfer-ai/flashinfer-bench` | `40e6ca7844b514eb4b1c7edba6d6a7377df57870` | 2026-04-30 |
 
+`flashinfer-bench/` is a copy of upstream at that commit **plus** the local patch
+series below. The installed dependency is not this tree — see
+[What is actually installed](#what-is-actually-installed).
+
 ---
 
 ## `KernelBench/`
@@ -104,10 +108,13 @@ the pin is meaningful.
 
 ### Patches (`third_party/patches/`)
 
-The vendored tree carries three local patches. They are kept as a numbered
-series so that a pin bump — which replaces the tree wholesale and therefore
-discards them — can replay them with `third_party/patches/apply.sh`, and so that
-each one maps 1:1 to an upstream PR when it is filed.
+The vendored tree carries three local patches, and the fork carries the same
+three as one commit (`19acd0df4a4a3c456db034f4e6c9defc21d91c40` on branch
+`hca-integration`) — see [What is actually installed](#what-is-actually-installed).
+They are kept here as a numbered series as well, so that a pin bump — which
+replaces the tree wholesale and therefore discards them — can replay them with
+`third_party/patches/apply.sh`, and so that each one maps 1:1 to an upstream PR
+when it is filed.
 
 | Patch | Touches | Why |
 |---|---|---|
@@ -124,6 +131,43 @@ taken because the alternative — the out-of-tree evaluator shim this replaced �
 made the emitted TraceSet unusable by anyone running the stock CLI. The property
 that rule protects (reproducible, reviewable upgrades) is preserved by keeping
 the patches reviewable and replayable rather than by having none.
+
+## What is actually installed
+
+The tree above is the **reference**, not the import. `pyproject.toml` binds the
+`flashinfer-bench` name to this project's fork at a pinned commit:
+
+| Installed from | Revision | Which is |
+|---|---|---|
+| `https://github.com/TianyiZhao1437/flashinfer-bench` | `19acd0df4a4a3c456db034f4e6c9defc21d91c40` | upstream `40e6ca7` + the three patches above, as one commit |
+
+So the same local changes exist twice, for different purposes:
+
+- **on the fork**, because that is what `pip` fetches — it is what the
+  interpreter imports, what the `flashinfer-bench` CLI runs, and what the
+  benchmark runner's worker subprocesses re-import in their own interpreters;
+- **in the tree plus `patches/`**, because that is what a reviewer can diff
+  against upstream and what survives a pin bump.
+
+Neither is derived from the other at install time. They agree by construction,
+and that is the invariant to check after touching either:
+
+```
+# the four files the patches touch must be identical in both
+for f in bench/utils.py bench/evaluators/lowbit.py bench/eval_config.yaml \
+         data/validate.py; do
+  cmp third_party/flashinfer-bench/flashinfer_bench/$f \
+      <fork-checkout>/flashinfer_bench/$f || echo "DRIFT: $f"
+done
+```
+
+Drift matters more here than for a typical vendored dependency, because
+`tools/gen_solution_llm.py` reads its prompts and its `KernelGenerator` from
+`third_party/flashinfer-bench/examples/` while driving the **installed** library.
+`examples/` is not part of the installed package — the fork's `pyproject.toml`
+declares package-data for `py.typed` and the CUTLASS headers only — so the two
+sources are genuinely separate halves that have to keep agreeing about the
+solution format.
 
 ## Why a copy and not a submodule
 

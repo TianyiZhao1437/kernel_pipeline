@@ -16,7 +16,25 @@ import shutil
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+
+# class last so that `--env` values win over anything inherited from the shell.
+#
+# KernelGenerator comes from the vendored tree, not from the installed package.
+# It is a worked example under examples/, and the fork's pyproject declares
+# package-data for py.typed and the CUTLASS headers only -- no examples/ -- so
+# it is absent from site-packages and cannot be imported from the install. The
+# tree it is read from and the library it drives are the same source only by
+# construction: `pyproject.toml` pins flashinfer-bench to the fork commit, and
+# third_party/VENDOR.md keeps this tree byte-identical to that commit's
+# patched state. Verified for the current pin: the four patched files
+# (bench/utils.py, evaluators/lowbit.py, eval_config.yaml, data/validate.py)
+# compare equal between the two, so the prompt format cannot disagree.
 GEN_DIR = REPO / "third_party/flashinfer-bench/examples/kernel_generator"
+if not (GEN_DIR / "kernel_generator.py").is_file():
+    raise SystemExit(
+        f"kernel_generator.py missing from {GEN_DIR}; re-stage the vendored "
+        "tree (third_party/VENDOR.md, 'Updating a pin')"
+    )
 sys.path.insert(0, str(GEN_DIR))
 sys.path.insert(0, str(REPO / "tools"))
 
@@ -29,7 +47,14 @@ if os.environ.get("GEN_FAULT_AFTER"):
 
 TASK = REPO / "tasks/hca_compress_c128"
 DEF_NAME = "hca_compress_c128_h512_r64"
-ROOT = REPO / "data/trace_sets/hca_c128_v4"
+# The root the generator evaluates its rounds against, and copies into scratch.
+# It must be the same workload corpus the benchmark later measures, or the
+# round-by-round feedback the model optimises against is a different -- and
+# smaller -- sweep than the trace it is finally judged on. It was pinned at the
+# old 20-workload hca_c128_v4 (nc = 1..1024); the corpus is now 23 workloads
+# (nc = 1..8192) and v4 is a strict subset of it, so the default moved to the
+# staged root. --root overrides.
+ROOT = REPO / "data/trace_sets/hca_compress_c128"
 
 
 def extract_code(text: str, language: str = "triton") -> str:
@@ -116,6 +141,12 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--max-tokens", type=int, default=16384)
     ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument("--code-retries", type=int, default=3,
+                    help="re-ask for a round's code this many times when the "
+                         "gateway returns an empty completion (content is None, "
+                         "which kernel_generator.py turns into an AttributeError "
+                         "on .strip()). One such drop killed an "
+                         "anthropic/claude-opus-5 run at round 3 of 10.")
     ap.add_argument("--stream", action="store_true",
                     help="accumulate a streamed response instead of waiting for "
                          "one buffered body; needed for gateways that hold a long "
@@ -125,7 +156,12 @@ def main() -> int:
                          "extra_body {\"thinking\": {\"type\": \"disabled\"}}, which "
                          "was measured to take completion reasoning from 149 tokens "
                          "to 0). Trades capability for a much shorter request.")
+    ap.add_argument("--root", type=pathlib.Path, default=ROOT,
+                    help="TraceSet root the rounds are evaluated against "
+                         f"(default: {ROOT.relative_to(REPO)})")
     args = ap.parse_args()
+
+    root = args.root if args.root.is_absolute() else (REPO / args.root)
 
     load_env(args.env)
     # The env file exports MODEL_NAME; honour it but let --model override.
@@ -243,9 +279,18 @@ def main() -> int:
 
         done = chunks[-1]
         usage = next((c.usage for c in reversed(chunks) if getattr(c, "usage", None)), None)
+        # content is "" and never None when the reply carried no visible text.
+        # A gateway that bills reasoning but emits none of it as content returns
+        # chunks with deltas that never populate `content`, and `None` here is
+        # not a neutral empty value: kernel_generator.py:448 reads
+        # `response.choices[0].message.content.strip()`, so None raises
+        # AttributeError and kills the whole run. That is what ended a
+        # claude-opus-5 run at round 5 -- 1 streamed chunk in 0.3s, i.e. a
+        # dropped request, not a model that declined to answer. The empty
+        # string instead reaches _codegen, which is the layer that can retry.
         msg = {
             "role": "assistant",
-            "content": "".join(content) or None,
+            "content": "".join(content),
             "reasoning_content": "".join(reasoning) or None,
         }
         if tool_calls:
@@ -274,15 +319,29 @@ def main() -> int:
     # the dataset does not contain. Give it a copy instead; only the source files
     # we write below come back out.
     scratch = REPO / "data" / "trace_sets" / f"_gen_{args.author}"
+    # A scratch copied from a *different* root would evaluate rounds against the
+    # wrong workloads and silently keep doing so, since the copy is only made
+    # when `definitions/` is missing. Stamp the source root and re-seed when it
+    # changes, removing the previous definitions/workloads first: a plain
+    # copytree(dirs_exist_ok=True) only adds and overwrites, so a file that
+    # shrank -- the 23-line workload sweep replacing a 20-line one -- would keep
+    # its old contents and the corpus would look correct while being stale.
+    stamp = scratch / ".source_root"
+    want = str(root.resolve())
+    if stamp.exists() and stamp.read_text().strip() != want:
+        print(f"scratch {scratch.name} came from another root; re-seeding", flush=True)
+        for sub in ("definitions", "workloads"):
+            shutil.rmtree(scratch / sub, ignore_errors=True)
     if not (scratch / "definitions").is_dir():
-        shutil.copytree(ROOT, scratch, dirs_exist_ok=True)
+        shutil.copytree(root, scratch, dirs_exist_ok=True)
+    stamp.write_text(want + "\n")
     # Start from an empty trace set each run: an earlier attempt's traces would
     # otherwise be inherited and read back as if this run had produced them.
     for author_dir in (scratch / "traces").glob("*"):
         for f in author_dir.rglob("*.jsonl"):
             f.write_text("")
     trace_set = TraceSet.from_path(str(scratch))
-    print(f"generator trace root: {scratch.relative_to(REPO)} (a copy of {ROOT.name})", flush=True)
+    print(f"generator trace root: {scratch.relative_to(REPO)} (a copy of {root.name})", flush=True)
     definition = trace_set.definitions[DEF_NAME]
     workloads = trace_set.workloads[DEF_NAME]
     print(f"definition {DEF_NAME}: {len(workloads)} workloads", flush=True)
@@ -301,14 +360,76 @@ def main() -> int:
     # extraction so the source that is actually built and evaluated has had the
     # surrounding prose removed. Applied to the instance, so third_party/ stays
     # as pinned.
+    #
+    # A gateway can also answer with an empty completion -- content is None,
+    # no exception -- which kernel_generator.py:448 turns into
+    # "'NoneType' object has no attribute 'strip'". That is not a bad reply to
+    # argue with, it is a dropped one, and retrying is the right response: an
+    # anthropic/claude-opus-5 run died at round 3 this way after a 216s stall
+    # that produced 2 streamed chunks and no content. Retry the same prompt a
+    # few times before surfacing it, and never hand None back to the caller,
+    # which has no guard for it.
     _raw_codegen = gen._generate_code_from_prompt
 
-    async def _codegen(prompt):
-        result = await _raw_codegen(prompt)
-        cleaned = extract_code(result.get("cleaned") or "", "triton")
-        if cleaned != result.get("cleaned"):
-            result["cleaned"] = cleaned
+    def _as_text(result):
+        """Normalise a generation result so .get('cleaned') is never None.
+
+        _codegen tolerates None via `or \"\"`, but kernel_generator.py reads the
+        key itself with .strip() on the content field, so the None has to be
+        replaced before the result is returned, not after.
+        """
+        for key in ("cleaned", "code", "raw"):
+            if key in result and result[key] is None:
+                result[key] = ""
         return result
+
+    async def _codegen(prompt):
+        """Ask for a round's code, tolerating a gateway that drops the request.
+
+        Two failure shapes, both seen from these gateways and both meaning "the
+        reply was lost", not "the model answered badly":
+
+          - content arrives as None and kernel_generator.py:448 raises
+            AttributeError on `.strip()` before returning anything;
+          - content arrives empty (the stream carried only reasoning).
+
+        Neither is a model mistake to argue with, so re-ask the same prompt.
+        The guard has to wrap the call, not just its result: the AttributeError
+        is raised *inside* _raw_codegen, so a caller inspecting the return value
+        never runs. That is why an earlier version of this retry never fired.
+        """
+        last = None
+        last_err = None
+        for attempt in range(1, args.code_retries + 1):
+            try:
+                result = _as_text(await _raw_codegen(prompt))
+            except AttributeError as e:
+                # The None-content path, before _as_text can normalise it.
+                last_err = e
+                print(f"  empty completion (attempt {attempt}/{args.code_retries}): "
+                      f"{e}; retrying", flush=True)
+                await asyncio.sleep(min(2 ** attempt, 15))
+                continue
+            text = result.get("cleaned") or result.get("code") or result.get("raw") or ""
+            if text.strip():
+                if attempt > 1:
+                    print(f"  code attempt {attempt} produced content", flush=True)
+                cleaned = extract_code(text, "triton")
+                if cleaned != result.get("cleaned"):
+                    result["cleaned"] = cleaned
+                return result
+            last = result
+            print(f"  empty completion (attempt {attempt}/{args.code_retries}); retrying",
+                  flush=True)
+            await asyncio.sleep(min(2 ** attempt, 15))
+
+        if last is None and last_err is not None:
+            # Every attempt raised. Re-raise rather than returning a fake empty
+            # result: the round should fail with the real cause attached.
+            raise last_err
+        print("  all attempts returned empty; passing the empty reply through so the "
+              "round fails loudly instead of silently", flush=True)
+        return _as_text(last if last is not None else {"cleaned": ""})
 
     gen._generate_code_from_prompt = _codegen
 

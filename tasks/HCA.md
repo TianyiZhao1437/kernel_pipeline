@@ -15,7 +15,7 @@ Artefacts:
 | File | Role |
 |---|---|
 | `tasks/hca_compress_c128/hca_compress_c128_h512_r64.json` | Definition |
-| `tasks/hca_compress_c128/hca_compress_c128_h512_r64.jsonl` | 17 Workloads |
+| `tasks/hca_compress_c128/hca_compress_c128_h512_r64.jsonl` | 23 Workloads |
 | `tasks/hca_compress_c128/hca_compress_c128_triton_h200.solution.json` | Triton Solution (generated) |
 | `tasks/hca_compress_c128/solutions/triton_h200/` | Solution sources, authoritative |
 | `tasks/hca_compress_c128/eval_config.yaml` | Measured tolerances, with derivation |
@@ -206,14 +206,26 @@ between the two var axes: `max_position > (num_compressed - 1) * compress_rate`.
 
 ## 3. The Workload sweep **[corrected]**
 
-20 workloads in `hca_compress_c128_h512_r64.jsonl`. Seventeen of them sweep
+23 workloads in `hca_compress_c128_h512_r64.jsonl`. Twenty of them sweep
 `num_compressed ∈ {1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
-768, 1024}` — i.e. 128 to 131072 tokens — with `max_position = num_compressed *
-128`. Following the 43-point GEMM sweep's shape: dense at the small end where
-launch overhead dominates, geometric through the middle, plus off-power-of-two
-points (24, 48, 96, 192, 384, 768) so nothing can quietly assume a power of two.
-The remaining three sit at `num_compressed = 64` and vary only the input
-*distribution* — see §7.7.
+768, 1024, 2048, 4096, 8192}` — i.e. 128 to 1048576 tokens — with
+`max_position = num_compressed * 128`. Following the 43-point GEMM sweep's shape:
+dense at the small end where launch overhead dominates, geometric through the
+middle, plus off-power-of-two points (24, 48, 96, 192, 384, 768) so nothing can
+quietly assume a power of two. The remaining three sit at `num_compressed = 64`
+and vary only the input *distribution* — see §7.7.
+
+The top of the sweep is not arbitrary. vLLM's V4 path derives
+`num_compressed` per token as `(positions + 1) // compress_ratio`
+(`deepseek_v4/attention.py:84`), and the allocation bound it is sized against is
+`cdiv(max_model_len, compress_ratio)` = 1048576/128 = **8192**
+(`sparse_mla.py:405`). The earlier sweep stopped at 1024, eight times short of
+the largest context the model is configured for, so it measured the middle of
+the range and called it the range. 2048/4096/8192 close that. They are also
+where the two shipped solutions stop being comparable: claude's kernel plateaus
+at a flat ~221 GB/s (4.6% of the H200's 4800 GB/s peak) from `nc=384` up, while
+the qwen kernel climbs to ~1963 GB/s (40.9%) — a factor of 8.9 at the top of the
+sweep that the truncated sweep could not see at all.
 
 The plan insisted the sweep must include **`total_tokens` not divisible by 128**,
 as "where real implementations break". **That is now structurally impossible**,
@@ -224,12 +236,21 @@ compressor on complete windows, gated by `state_metadata.c128_boundary`; the
 partial tail lives in the *caller*, outside this task. Encoding an impossible
 input would have tested a case the kernel never sees.
 
-Input descriptors are all `{"type": "random"}`, with one known consequence
-recorded in `eval_config.yaml`: random data never drives a 64-element block's
-absmax below `1e-4`, so the `clamp(min=1e-4)` guard is never exercised. Closing
-that would need a degenerate near-zero `kv_state` workload. Left open
-deliberately — the clamp only guards a division by ~0 and cannot produce a
-wrong-but-plausible result.
+Input descriptors are no longer all `{"type": "random"}`. The `nc <= 128`
+workloads (17 of the 23) carry all five inputs as safetensors blobs built from
+the real V4 weights, because randn makes two of them physically impossible —
+cos/sin tables 30x off the unit circle, and an RMSNorm gain that is half
+negative. Above 128 the two 256 KB-per-entry inputs stay random on purpose; those
+workloads are there to measure bandwidth, and the four same-shape stress
+workloads demonstrate that input values do not move a streaming op's latency.
+See `eval_config.yaml` for the census and the derivation.
+
+The `clamp(min=1e-4)` guard is now exercised. The `tiny` stress workload scales
+`kv_state` to ~1e-7, which drives 98.66% of its quantisation blocks under the
+clamp, and both solutions pass it at `matched_ratio = 1.00000000`. Real
+activations do not reach it (exponent span `[-11, -7]` against a clamp at
+`-22`), so the earlier note that it was untested held for real data and only a
+degenerate input closes it.
 
 ---
 
@@ -282,9 +303,22 @@ numbers are held honest by a **mutation battery**: eight single-token semantic
 edits to the reference, each of which the configuration must reject while
 accepting the solution.
 
+There are two measurement scopes here and they are not interchangeable, so both
+are quoted with their scope. The battery runs each mutation on **one synthetic
+input**; the trace sweep runs the real solutions over all 23 workloads. The
+sweep is the stricter of the two and is what the threshold actually has to clear:
+
 ```
-solution worst 0.99998692  >  threshold 0.999  >  best mutation 0.962821
+                        single synthetic input        over the 23-workload sweep
+solution worst          0.99998692                    0.99998256   (claude @ nc=128)
+best mutation           0.962821  (quant, no bf16)    0.959577     (same mutation @ nc=64)
+margin to 0.999         0.037179                      0.039423
 ```
+
+Both ends come from the same mutation (quantisation that skips the bf16 round),
+which is reassuring rather than coincidental: it is the least severe edit in the
+battery precisely because it perturbs one rounding step instead of a whole
+tensor, and that property does not depend on which input it is run against.
 
 Run it with `/venv/tianyi/bin/python3 tools/check_hca_numerics.py --mutations`.
 The harness reads its tolerances *from* `eval_config.yaml` rather than repeating
@@ -348,7 +382,7 @@ complete and is not.
 
 The task now has data. `tools/run_benchmark.py tasks/hca_compress_c128` produced
 17 traces, one per workload, all `PASSED`, written to
-`data/trace_sets/hca_compress_c128/traces/claude-opus-5/hca_compress/`.
+`data/trace_sets/hca_compress_c128/traces/tim.zhao/hca_compress/`.
 
 Three things came out of it.
 
@@ -424,34 +458,42 @@ Python loop that exists to prove the reference is a *spec*, not to be fast.
 
 ### It reframes the seed solution's performance
 
-| num_compressed | 1 | 64 | 256 | 512 | 1024 |
-|---|---|---|---|---|---|
-| baseline GB/s | 1.5 | 81.3 | 330.7 | 661.3 | **1274.4** |
-| seed GB/s | 2.8 | 126.2 | 201.7 | 222.5 | 219.8 |
-| baseline % of peak | 0.04 | 1.93 | 7.84 | 15.68 | **30.22** |
-| baseline vs seed | 0.53x | 0.64x | 1.64x | 2.97x | **5.80x** |
+| num_compressed | 1 | 64 | 256 | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|---|---|---|
+| baseline GB/s | 2.9 | 85.1 | 341.5 | 667.2 | 1290.4 | 1372.1 | 1418.6 | **1442.4** |
+| seed GB/s | 2.8 | 126.1 | 202.4 | 223.2 | 220.5 | 220.6 | 221.2 | **221.2** |
+| baseline % of peak | 0.06 | 1.77 | 7.11 | 13.90 | 26.88 | 28.58 | 29.55 | **30.05** |
+| baseline vs seed | 1.01x | 0.68x | 1.69x | 2.99x | 5.85x | 6.22x | 6.41x | **6.52x** |
+
+(The `1024` column is the top of the originally-shipped sweep; the three to its
+right are the points added afterwards. They move the baseline's best from
+1274.4 GB/s to 1442.4 — 12% — while leaving the seed at 222.5 → 221.2, which is
+the whole argument for extending the sweep: a kernel on the roofline is already
+saturated and gains nothing from more length, and a kernel on a fixed per-call
+cost is unmasked by it.)
 
 §7.5 recorded the seed at 1.18x the eager reference at the top of the sweep and
 called that flattering. It was: against the compiler the same kernel **loses by
-5.8x**. The 19x-off-roofline headroom is real, but 5.8x of it is available
-without writing a kernel at all, which is the honest bar. Note the crossover —
-the seed wins below num_compressed ≈ 128 and loses above it.
+6.5x** at `nc=8192` (5.9x at 1024). The 19x-off-roofline headroom is real, but
+6.5x of it is available without writing a kernel at all, which is the honest bar.
+Note the crossover — the seed wins below num_compressed ≈ 128 and loses above it.
 
 ### It exposes a fixed-overhead floor the sweep cannot see past
 
 The baseline's latency is **flat at ~0.20 ms from num_compressed = 2 to 768**
-while the bytes moved grow 400-fold. Only at 1024 does streaming dominate. (The
+while the bytes moved grow 400-fold. Only past 1024 does streaming dominate. (The
 n=1 point is the one shape Inductor compiles statically and the only one below
 the floor, at 0.176 ms; every later shape gets the dynamic kernel and its
 guards.) The seed Triton kernel's floor is ~0.093 ms, so this is the baseline's
 own dispatch/guard cost, not a harness artefact.
 
-Consequence for the task: only the largest one or two workloads measure memory
+Consequence for the task: only the largest few workloads measure memory
 throughput at all. A candidate faces two unrelated targets — beat ~0.2 ms of
-per-call overhead below num_compressed ≈ 768, and beat 1274 GB/s above it. This
+per-call overhead below num_compressed ≈ 768, and beat 1442 GB/s above it. This
 is the strongest argument yet that the sweep needs a second free axis (§8, item
 6): 17 points along `num_compressed` buy almost nothing once the first ~12 are
-all measuring the same constant.
+all measuring the same constant. (The extra points added at the top are what
+showed that the second target is reachable at all; see §3.)
 
 ### It is the first thing the tolerances *caught* rather than confirmed
 
@@ -555,13 +597,20 @@ exactly — measured kurtosis **429**, against 3.0 for a Gaussian.
 |  | UE8M0 exponents | distinct | `clamp(1e-4)` hit |
 |---|---|---|---|
 | randn (before) | `[-8, -4]` | 5 | 0/24913 (0.00%) |
-| real (after) | `[-22, -7]` | 7 | 443/26257 (1.69%) |
+| real (after) | `[-22, -7]` | 7 | 442/4305 (10.27%) |
+
+The `real` denominator counts only the workloads whose `kv_state` is blobbed
+(17 of the 23, 4305 blocks); the `nc > 128` points have no real `kv_state` to
+compute an exponent from. Every one of the 442 clamp hits is inside the single
+`tiny` stress workload — 442 of its 448 blocks, 98.66% — and no real-activation
+workload contributes one. The earlier revision of this row read `443/26257
+(1.69%)`, which pooled the sweep's own random-data blocks into the denominator.
 
 Against a representable `[-22, 120]` this is still one-sided — real activations
 do not produce huge-magnitude blocks either — but the span is 15 exponents
 instead of 4, and the lower bound is now *exactly* the clamp. That closes §8
 item 3: the `clamp(min=1e-4)` path, which no workload had ever executed, is now
-driven by a `tiny` stress workload at 98.9% of its blocks, and both solutions
+driven by a `tiny` stress workload at 98.66% of its blocks, and both solutions
 pass it at `matched_ratio = 1.00000000`.
 
 ### It also settles whether input values can matter at all
@@ -604,18 +653,25 @@ because the probe calls `run` directly, with inputs already resident and no
 correctness pass.) A candidate kernel that is not a compiled graph, like the
 Triton seed, shows none of it.
 
-Across the whole sweep the baseline's best is 1274.4 GB/s (30.22% of peak)
-against 1227.6 on random data, and the Triton seed's is 222.5 GB/s (5.28%)
-against 222.6 — identical to within noise.
+Across the whole sweep the baseline's best is 1442.4 GB/s (30.05% of peak) at
+`nc=8192`, and the Triton seed's is 223.2 GB/s (4.65%) at `nc=512` — and both
+plateau there: the seed is flat at ~221 GB/s from `nc=384` to `nc=8192`, which is
+a fixed serial cost per entry rather than bandwidth saturation. Those are the
+figures the extended sweep makes visible. On the originally-shipped range (up to
+`nc=1024`) the baseline's best was 1290.4 GB/s and the seed's 222.5 GB/s, so the
+eight-fold-longer points changed what the baseline can reach by 12% and left the
+seed where it was — which is the whole argument for extending the sweep.
 
 ### Sizing
 
 Since `gen_inputs` dispatches per input *name*, blobs and random can be mixed
-within one workload. All 20 workloads get real `rms_norm_weight`/`cos_cache`/
-`sin_cache`; `kv_state`/`score_state` are blobbed only up to
+within one workload. All 17 blob-backed workloads get real `rms_norm_weight`/
+`cos_cache`/`sin_cache`; `kv_state`/`score_state` are blobbed only up to
 `num_compressed = 128`. Above that they stay random, because those workloads
 exist to measure bandwidth and — per the table above — values cannot change a
-bandwidth number. Total 271 MB instead of ~1 GB.
+bandwidth number. Total 719 MB instead of several GB. (The earlier revision said
+"all 20 workloads" and "271 MB"; both predate the extra sweep points, and the
+denominator is 17 because the three stress workloads are blobbed as well.)
 
 The generator (`tools/gen_workload_blobs.py`) is seeded and never overwrites the
 authored sweep in place. This is the point worth keeping: a captured blob is one
@@ -630,16 +686,24 @@ has to be correct across the distribution, so the input distribution is now a
 1. Author `docs/op-types/hca-compress.mdx` (in this repo, not the vendored tree).
 2. ~~Produce the first Trace~~ — done, §7.5.
 3. ~~Close the `clamp(min=1e-4)` coverage gap~~ — done, §7.7: the `tiny` stress
-   workload drives 98.9% of its blocks under the clamp.
+   workload drives 98.66% of its blocks under the clamp.
 4. Optionally revisit C128A index construction (§0) as a second task.
 5. Decide whether the small workloads (num_compressed <= 32) stay. They cost
    nothing to run and they do test the partial-window and n=1 edges, but their
    `speedup_factor` is overhead noise (§7.5) and must not feed a ranking.
-6. Give the sweep a second free axis. §7.6 makes this concrete rather than
-   aesthetic: with `num_compressed` as the only variable, ~12 of the 17
-   workloads sit on the baseline's flat overhead floor and measure the same
-   constant. Candidates: make `compress_rate` or `head_dim` `var`, or add C64 /
-   C256 Definitions.
+6. Give the sweep a second free axis. **Largely answered by the V4 evidence, and
+   the answer is that there is no second axis to give.** `num_compressed` and
+   `max_position` are perfectly collinear — every workload sets
+   `max_position = num_compressed * 128`, and the kernel reads exactly one
+   cos/sin row per entry, the row at `c * compress_rate`, so varying
+   `max_position` independently addresses no new memory. batch and seqlen are
+   not axes at all: `kv_state` is a zero-copy view of vLLM's contiguous
+   `[total_tokens, head_dim]` buffer and `num_compressed = total_tokens // 128`,
+   so the batch dimension is flattened away before this op is reached. What is
+   left is §7.6's original suggestion — a second *Definition* at another
+   compression ratio (C64/C256) — plus §7.7's line-by-line diff against the
+   native `DeepseekV4HCACompressor`, which is the check that would actually
+   catch a convention error rather than a coverage gap.
 7. ~~Add a baseline solution~~ — done, §7.6.
 8. Report the `torch.isinf` float8 defect (§7.5) and the hardcoded
    `BenchmarkConfig` in `validate.py`'s `benchmark` check (§7.6) upstream.

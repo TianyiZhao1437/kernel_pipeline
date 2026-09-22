@@ -31,7 +31,10 @@ def main():
     ap.add_argument("--out", type=pathlib.Path, required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--definition", required=True)
-    ap.add_argument("--author", default="claude-opus-5")
+    # Hand-authored solutions are credited to the human who wrote them. The
+    # seed was previously labelled "claude-opus-5" purely because this default
+    # said so, which made a hand-written baseline read as a model attempt.
+    ap.add_argument("--author", default="tim.zhao")
     ap.add_argument("--entry-point", required=True)
     ap.add_argument("--language", required=True)
     ap.add_argument("--target-hardware", action="append", required=True)

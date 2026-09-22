@@ -4,10 +4,19 @@ version = "0.1.0"
 description = "GPU kernel tasks and traces in the flashinfer-bench format, targeting H200."
 requires-python = ">=3.10"
 
-# flashinfer-bench comes from the pinned copy under third_party/, never from
-# PyPI -- see third_party/VENDOR.md for why this repository vendors rather than
-# tracks, and third_party/patches/ for the local patch series. The path source
-# below is what binds the name to that copy.
+# flashinfer-bench comes from this project's fork, pinned to a commit -- never
+# from PyPI. See third_party/VENDOR.md for why the reference is pinned rather
+# than tracked, and third_party/patches/ for the patch series that the fork's
+# commit now carries. The git source below is what binds the name.
+#
+# The revisions are pinned, not the branch. A fork branch would reintroduce
+# exactly the drift VENDOR.md rules out: a push to the fork would change what
+# this repository validates against with no commit here. Bumping the pin is a
+# deliberate edit to `rev` below plus the table in VENDOR.md.
+#
+# No credential is embedded -- a token in a committed URL is a leak, and the
+# repository is public, so a plain HTTPS fetch resolves it. Pushing to the fork
+# still needs auth; that is a local git concern, not this file's.
 dependencies = [
     "flashinfer-bench",
     "torch>=2.8.0",
@@ -18,7 +27,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-flashinfer-bench = { path = "third_party/flashinfer-bench", editable = true }
+flashinfer-bench = { git = "https://github.com/TianyiZhao1437/flashinfer-bench.git", rev = "19acd0df4a4a3c456db034f4e6c9defc21d91c40" }
 
 [tool.uv]
 # This repository is scripts and data, not an importable package.

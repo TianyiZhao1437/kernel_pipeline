@@ -1,7 +1,7 @@
 {
   "name": "hca_compress_c128_triton_h200",
   "definition": "hca_compress_c128_h512_r64",
-  "author": "claude-opus-5",
+  "author": "tim.zhao",
   "spec": {
     "language": "triton",
     "target_hardware": [

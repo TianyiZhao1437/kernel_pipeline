@@ -312,10 +312,40 @@ print(f"wrote {out} ({out.stat().st_size} bytes)")
 # num_compressed is the only real degree of freedom: it is kv_state.shape[0],
 # and total_tokens = num_compressed * 128. The sweep is geometric with the
 # 1.5x midpoints filled in, from a single window (the degenerate case, where a
-# kernel that assumes multiple programs breaks) up to 1024 windows = 128k
-# tokens, which is DeepSeek-V4's context length.
+# kernel that assumes multiple programs breaks) up to 8192 windows = 1M tokens.
+#
+# The top of the range is not a taste call. DeepSeek-V4-Flash's
+# ``max_position_embeddings`` is 1048576, and vLLM sizes its pre-allocated
+# C128A index buffers as ``cdiv(max_model_len, compress_ratio)`` = exactly 8192
+# (deepseek_v4/sparse_mla.py) -- that number is compiled into
+# ``_build_c128a_topk_metadata_kernel`` as ``max_compressed_tokens`` and is the
+# largest ``num_compressed`` the model can ever present to this op. An earlier
+# revision stopped at 1024 = 128k tokens and described that as "DeepSeek-V4's
+# context length"; V4's context is eight times longer, so the sweep was covering
+# an eighth of the realizable range. The three points added here close that gap.
+#
+# What varies across the sweep is still only this one axis. ``max_position``
+# tracks it at the minimum the constraint allows (``n * COMPRESS_RATE``), because
+# the kernel reads exactly one cos/sin row per entry -- row ``c * compress_rate``
+# -- so every row past the last entry's boundary is dead weight, and varying the
+# table size independently spans no new addresses. ``batch`` and ``seqlen`` are
+# not axes at all: they are flattened into ``total_tokens`` before this op sees
+# the buffer, and ``num_compressed = total_tokens // 128`` is what survives.
 COMPRESS_RATE = 128
-NUM_COMPRESSED = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+NUM_COMPRESSED = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
+                  768, 1024, 2048, 4096, 8192]
+
+# The three stress workloads are part of the sweep and must be written here too.
+# They were previously appended by ``gen_workload_blobs.py --stress`` after this
+# script had written only the seed sweep, so the checked-in file ended up holding
+# both while this script's output held neither -- and since the script opens
+# ``wl_path`` with "w", re-running it to change the sweep silently deleted them.
+# That is exactly what happened when the three large points above were added: the
+# rebuild left 20 valid workloads and no stress entries, with nothing in the
+# output saying a deletion had occurred. The mapping is imported rather than
+# restated so there is one source for the uuids and their generator modes; the
+# two writers now agree because one of them no longer writes them.
+from gen_workload_blobs import STRESS_WORKLOADS  # noqa: E402
 
 wl_path = out.with_suffix(".jsonl")
 with wl_path.open("w") as fh:
@@ -341,5 +371,24 @@ with wl_path.open("w") as fh:
             )
             + "\n"
         )
-print(f"wrote {wl_path} ({len(NUM_COMPRESSED)} workloads, "
-      f"num_compressed {NUM_COMPRESSED[0]}..{NUM_COMPRESSED[-1]})")
+    for uuid, (_mode, n) in STRESS_WORKLOADS.items():
+        fh.write(
+            json.dumps(
+                {
+                    "definition": DEFINITION["name"],
+                    "solution": None,
+                    "workload": {
+                        "uuid": uuid,
+                        "axes": {"num_compressed": n, "max_position": n * COMPRESS_RATE},
+                        "inputs": {
+                            k: {"type": "random"}
+                            for k in DEFINITION["inputs"]
+                        },
+                    },
+                    "evaluation": None,
+                }
+            )
+            + "\n"
+        )
+print(f"wrote {wl_path} ({len(NUM_COMPRESSED)} sweep + {len(STRESS_WORKLOADS)} stress "
+      f"workloads, num_compressed {NUM_COMPRESSED[0]}..{NUM_COMPRESSED[-1]})")

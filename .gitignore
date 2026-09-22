@@ -26,5 +26,18 @@ __pycache__/
 # The intermediate is a build artefact; the promoted <definition>.jsonl is not.
 tasks/*/*.real.jsonl
 
+# The delivery package is 724 MB, 720 MB of which is the 23 workload safetensors
+# blobs. It is assembled from this repository by tools/ and handed to the
+# customer as a separate artefact -- it is not source, and committing it would
+# put a binary blob store in git history. Rebuild it by running the
+# task_hca_compress_c128/ README's staging steps; every authoritative input
+# lives here in the repository.
+/delivery/
+
+# Scratch space: intermediate solution sources, the unpromoted workload sweep,
+# and superseded trace sets kept aside during debugging. All of it is either
+# reproducible from the commands in the READMEs or deliberately discarded.
+/tmp/
+
 # OS
 .DS_Store
