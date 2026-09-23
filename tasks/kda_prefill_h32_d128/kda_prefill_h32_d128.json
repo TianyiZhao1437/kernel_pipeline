@@ -1,0 +1,125 @@
+{
+  "name": "kda_prefill_h32_d128",
+  "description": "Kimi Delta Attention (KDA), chunked prefill form. num_heads = 32, head_dim = 128 for both key and value, chunk_size = 64, q/k l2-normalised in-kernel. The linear-attention layer of Kimi Linear (3 KDA : 1 full MLA). Gated DeltaNet with a per-channel forget gate: S_t = (I - beta_t k_t k_t^T) Diag(exp(g_t)) S_{t-1} + beta_t k_t v_t^T. Consumes the recurrent state and returns the updated one, so a chunked prefill can be continued. FLOP-bound, not bandwidth-bound: rank on achieved TFLOP/s against a measured matmul peak.",
+  "op_type": "kda",
+  "tags": [
+    "stage:prefill",
+    "model:kimi-linear",
+    "linear-attention",
+    "delta-rule",
+    "status:unverified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences prefilled together."
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Prefill length in tokens. Not required to be a multiple of chunk_size; the reference pads to a chunk boundary and trims the output. Unaligned lengths are included in the sweep on purpose, since a kernel that assumes alignment is wrong on real traffic."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "chunk_size": {
+      "type": "const",
+      "value": 64
+    }
+  },
+  "constraints": [
+    "num_heads == 32",
+    "head_dim == 128",
+    "chunk_size == 64",
+    "seq_len >= 1",
+    "batch_size >= 1"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query after the short causal conv. L2-normalised inside the op."
+    },
+    "key": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key after the short causal conv. L2-normalised inside the op."
+    },
+    "value": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value after the short causal conv."
+    },
+    "g": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Per-channel log forget gate, produced as -exp(A_log) * softplus(x) and therefore STRICTLY NEGATIVE. exp(cumsum(g)) is the decay applied to the state. Positive entries make the recurrence diverge; this input cannot be filled with randn."
+    },
+    "beta": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Per-head delta-rule step size, a sigmoid output and therefore in (0, 1). Values outside that range are not a distribution shift, they are a different update rule."
+    },
+    "initial_state": {
+      "shape": [
+        "batch_size",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Recurrent state carried in. Zeros for a fresh prefill; a measured state when continuing a chunked prefill."
+    }
+  },
+  "outputs": {
+    "core_attn_out": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output, before the gated RMSNorm and o_proj."
+    },
+    "final_state": {
+      "shape": [
+        "batch_size",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Recurrent state after the last token. fp32 because it is a running sum of rank-1 updates over the whole sequence."
+    }
+  },
+  "reference": "\nimport torch\nimport torch.nn.functional as F\n\n_CHUNK = 64\n_L2_EPS = 1e-6\n\n\ndef _l2norm(x):\n    \"\"\"FLA's l2norm: +eps inside the sqrt, not max(norm, eps).\n\n    The difference from F.normalize is small but systematic, and the released\n    model's numerics were trained against this one.\n    \"\"\"\n    return x / torch.sqrt((x * x).sum(-1, keepdim=True) + _L2_EPS)\n\n\ndef run(query, key, value, g, beta, initial_state):\n    \"\"\"Kimi Delta Attention, chunked prefill form.\n\n    query/key/value : [batch, seq_len, num_heads, head_dim]\n    g               : [batch, seq_len, num_heads, head_dim]  log decay, <= 0\n    beta            : [batch, seq_len, num_heads]            in (0, 1)\n    initial_state   : [batch, num_heads, head_dim, head_dim] fp32\n\n    Returns (out [batch, seq_len, num_heads, head_dim], final_state).\n    \"\"\"\n    out_dtype = query.dtype\n\n    # Everything runs in fp32: the state is a running sum of rank-1 updates over\n    # the whole sequence, so bf16 accumulation drifts badly at long context.\n    query, key, value, beta, g = [\n        x.transpose(1, 2).contiguous().to(torch.float32)\n        for x in (query, key, value, beta, g)\n    ]\n\n    # l2norm before the scale, matching the kernel's internal order.\n    query = _l2norm(query)\n    key = _l2norm(key)\n\n    batch_size, num_heads, seq_len, k_head_dim = key.shape\n    v_head_dim = value.shape[-1]\n    scale = 1.0 / (k_head_dim ** 0.5)\n\n    pad_size = (_CHUNK - seq_len % _CHUNK) % _CHUNK\n    padded_len = seq_len + pad_size\n\n    query = F.pad(query, (0, 0, 0, pad_size)) * scale\n    key = F.pad(key, (0, 0, 0, pad_size))\n    value = F.pad(value, (0, 0, 0, pad_size))\n    g = F.pad(g, (0, 0, 0, pad_size))\n    beta = F.pad(beta, (0, pad_size))\n\n    v_beta = value * beta.unsqueeze(-1)\n    k_beta = key * beta.unsqueeze(-1)\n\n    query, key, value, g, k_beta, v_beta = [\n        x.reshape(x.shape[0], x.shape[1], -1, _CHUNK, x.shape[-1])\n        for x in (query, key, value, g, k_beta, v_beta)\n    ]\n\n    # Per-channel decay accumulates within the chunk. This is the one place KDA\n    # differs from Gated DeltaNet, where g is per-token and broadcast over the\n    # head dim.\n    g = g.cumsum(dim=-2)\n\n    eye_mask = torch.triu(\n        torch.ones(_CHUNK, _CHUNK, dtype=torch.bool, device=query.device), diagonal=0\n    )\n    strict_mask = torch.triu(\n        torch.ones(_CHUNK, _CHUNK, dtype=torch.bool, device=query.device), diagonal=1\n    )\n    decay_mask = (\n        (g.unsqueeze(-2) - g.unsqueeze(-3))\n        .masked_fill(strict_mask[..., None], float(\"-inf\"))\n        .exp()\n    )\n\n    # WY representation: build (I - tril(K_beta K^T))^{-1} by forward\n    # substitution rather than an explicit inverse. This loop is the UT\n    # transform, and it is the part a real kernel replaces with a blocked\n    # triangular solve.\n    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1)\n    attn = attn.masked_fill(eye_mask, 0)\n    for i in range(1, _CHUNK):\n        row = attn[..., i, :i].clone()\n        sub = attn[..., :i, :i].clone()\n        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)\n    attn = attn + torch.eye(_CHUNK, dtype=attn.dtype, device=attn.device)\n\n    value = attn @ v_beta\n    k_cumdecay = attn @ (k_beta * g.exp())\n\n    if initial_state is None:\n        state = torch.zeros(\n            batch_size, num_heads, k_head_dim, v_head_dim,\n            dtype=torch.float32, device=value.device,\n        )\n    else:\n        state = initial_state.to(torch.float32).clone()\n\n    core_attn_out = torch.zeros_like(value)\n    causal_mask = torch.triu(\n        torch.ones(_CHUNK, _CHUNK, dtype=torch.bool, device=query.device), diagonal=1\n    )\n\n    for i in range(padded_len // _CHUNK):\n        q_i = query[:, :, i]\n        k_i = key[:, :, i]\n        v_i = value[:, :, i]\n        g_i = g[:, :, i]\n\n        # Contribution of everything before this chunk, carried by the state.\n        attn_inter = (q_i * g_i.exp()) @ state\n        # Contribution from within the chunk.\n        attn_intra = (\n            (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])\n            .sum(dim=-1)\n            .masked_fill(causal_mask, 0)\n        )\n        # The delta rule: subtract what the state already predicts.\n        v_prime = k_cumdecay[:, :, i] @ state\n        v_new = v_i - v_prime\n\n        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new\n        state = (\n            state * g_i[:, :, -1].exp().unsqueeze(-1)\n            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new\n        )\n\n    core_attn_out = core_attn_out.reshape(\n        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]\n    )\n    core_attn_out = core_attn_out[:, :, :seq_len]\n    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(out_dtype)\n\n    return core_attn_out, state\n"
+}

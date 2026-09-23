@@ -1,0 +1,12 @@
+{
+  "name": "qwen3.8-max_kda_prefill_h32_d128_triton_optimized_r10_c0",
+  "author": "qwen3.8-max",
+  "model": "qwen3.8-max",
+  "entry_point": "main.py::run",
+  "target_hardware": [
+    "H200"
+  ],
+  "language": "SupportedLanguages.TRITON",
+  "description": "qwen3.8-max optimized kernel for kda_prefill_h32_d128 (round 10, candidate 0)",
+  "rounds": 10
+}

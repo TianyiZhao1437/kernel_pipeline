@@ -100,6 +100,10 @@ class DefaultEvaluator(Evaluator):
     ) -> Tuple[Optional[Correctness], Optional[Evaluation]]:
         max_abs = 0.0
         max_rel = 0.0
+        # Minimum over outputs, matching the lowbit evaluator's convention:
+        # a trace fails if ANY output falls under required_matched_ratio, so the
+        # figure worth recording is the worst one, not a pooled average.
+        min_matched_ratio = 1.0
         numerical_incorrect = False
         is_dps = sol_runnable.metadata.destination_passing_style
 
@@ -153,15 +157,22 @@ class DefaultEvaluator(Evaluator):
                     )
 
                 # Compute error statistics
-                abs_err, rel_err, exceeds_tol, _ = compute_error_stats(sol_tensor, ref_tensor, cfg)
+                abs_err, rel_err, exceeds_tol, matched_ratio = compute_error_stats(
+                    sol_tensor, ref_tensor, cfg
+                )
 
                 if exceeds_tol:
                     numerical_incorrect = True
 
+                min_matched_ratio = min(min_matched_ratio, matched_ratio)
                 max_abs = max(max_abs, abs_err)
                 max_rel = max(max_rel, rel_err)
 
-        correctness = Correctness(max_relative_error=max_rel, max_absolute_error=max_abs)
+        correctness = Correctness(
+            max_relative_error=max_rel,
+            max_absolute_error=max_abs,
+            extra={"matched_ratio": min_matched_ratio},
+        )
 
         if numerical_incorrect:
             return correctness, make_eval(

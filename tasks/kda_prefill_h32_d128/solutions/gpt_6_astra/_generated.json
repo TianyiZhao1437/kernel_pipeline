@@ -1,0 +1,12 @@
+{
+  "name": "openai/gpt-6-astra_kda_prefill_h32_d128_triton_optimized_r4_c0",
+  "author": "openai/gpt-6-astra",
+  "model": "openai/gpt-6-astra",
+  "entry_point": "main.py::run",
+  "target_hardware": [
+    "H200"
+  ],
+  "language": "SupportedLanguages.TRITON",
+  "description": "openai/gpt-6-astra optimized kernel for kda_prefill_h32_d128 (round 4, candidate 0)",
+  "rounds": 10
+}

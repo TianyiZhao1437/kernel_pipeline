@@ -5,9 +5,11 @@
 The repository already *performs* this pipeline for one task. `tools/` has eleven
 scripts that stage, validate, benchmark and score `hca_compress_c128`, and the
 record in `tasks/HCA.md` shows what each of them caught. What is missing is not a
-capability but a **shape**: the steps live in prose and shell history, every path
-is a hardcoded module constant, and nothing connects `tools/gen_solution_llm.py`
-to `tools/run_benchmark.py` except a human remembering the order.
+capability but a **shape**: the steps live in prose and shell history, most paths
+are hardcoded module constants, and nothing connects `tools/gen_solution_llm.py`
+to `tools/run_benchmark.py` except a human remembering the order. (Since this was
+written, `gen_solution_llm.py` takes `--task-dir` and derives the rest; the other
+scripts have not followed.)
 
 So this document is written to be **wrong in a checkable way where it disagrees
 with the repository**, not to be aspirational. Every section names the existing
@@ -270,12 +272,16 @@ BASE_URL    LLM_API_KEY                              (a second pair)
 OPENAI_COMPAT_BASE_URL  OPENAI_COMPAT_API_KEY        (a third)
 ```
 
-Nothing in the repo says which set `gen_solution_llm.py` reads, which is how a
-model can appear configured and still fail. The contract should be: one
-`models.yaml` naming, per model, the env file, the model string, and a
-**capability declaration** (context length, whether it emits tool calls, whether
-it streams reasoning). The run manifest is then a list of model names plus the
-task, and it is the *only* input to step 3.
+Nothing in the repo said which set `gen_solution_llm.py` reads, which is how a
+model can appear configured and still fail. `models.yaml` + `tools/model_config.py`
+now close this: one entry per model naming the model string, base URL, key and
+the author the solution is filed under, and `model_config.apply` exports all
+seven spellings so the vendored generator finds the pair it happens to read. What
+is still missing is the **capability declaration** (context length, whether it
+emits tool calls, whether it streams reasoning) — and the token budget belongs
+there too, since a ceiling that is ample for one task truncates another into an
+empty reply (`docs/contracts.md` C1 item 6). The run manifest is then a list of
+model names plus the task, and it is the *only* input to step 3.
 
 ### 3.2 Step 2: environment verification
 
@@ -302,9 +308,10 @@ Two invariants, both already learned the hard way:
    20-workload `hca_c128_v4`, and if generation evaluates against a smaller sweep
    than the trace is later judged on, "the round-by-round feedback the model
    optimises against is a different — and smaller — sweep than the trace it is
-   finally judged on". Today both defaults point at
-   `data/trace_sets/hca_compress_c128` and **nothing enforces it**. This should
-   be an assertion in the orchestrator.
+   finally judged on". Both are now derived from `--task-dir`, so they agree by
+   construction rather than by two defaults happening to match; `--root` still
+   overrides and **nothing enforces** the override. This should be an assertion
+   in the orchestrator.
 2. **Retries wrap the whole call, not the request.** See §3.2.
 
 The loop itself is `KernelGenerator`: one `get_prompt`, then per round evaluate →
@@ -356,12 +363,12 @@ Listed so they can be turned into work items rather than rediscovered.
 | # | Gap | Where |
 |---|---|---|
 | 1 | No orchestrator; steps are chained by hand | new `tools/run_pipeline.py` |
-| 2 | No `task.yaml`; paths and identities are module constants | `tools/*.py` (e.g. `TASK`, `DEF_NAME`, `ROOT` in `gen_solution_llm.py`) |
-| 3 | No `models.yaml`; four env files × seven aliases, unread contract | new |
+| 2 | No `task.yaml`; paths and identities are module constants | `tools/*.py`; **closed in `gen_solution_llm.py`** (a `Task` class derives the definition name, root and eval config from `--task-dir`), open elsewhere |
+| 3 | No `models.yaml`; four env files × seven aliases, unread contract | **closed** — `models.yaml` + `tools/model_config.py` |
 | 4 | No report generator | new |
 | 5 | Anti-hack checks (C2) do not exist in any form | `tools/verify_task.py` |
 | 6 | Input-realism is not a declared, checkable property | `tools/verify_task.py` + `task.yaml` |
-| 7 | Generation root and measurement root can silently diverge | enforce in the orchestrator |
+| 7 | Generation root and measurement root can silently diverge | **narrowed** — both derive from `--task-dir`; an explicit `--root` still overrides unchecked |
 | 8 | Four schema constraints live in prose (`HCA.md` §2) | promote to `verify_task.py` checks |
 | 9 | `validate.py`'s `benchmark` check carries a hardcoded `BenchmarkConfig` | reconcile, or document the divergence |
 | 10 | No token accounting; `gen_solution_llm.py` extracts `usage` and drops it on the floor | optional, but it is why run cost is unanswerable |

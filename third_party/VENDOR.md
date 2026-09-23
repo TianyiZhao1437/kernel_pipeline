@@ -108,13 +108,19 @@ the pin is meaningful.
 
 ### Patches (`third_party/patches/`)
 
-The vendored tree carries three local patches, and the fork carries the same
-three as one commit (`19acd0df4a4a3c456db034f4e6c9defc21d91c40` on branch
-`hca-integration`) — see [What is actually installed](#what-is-actually-installed).
-They are kept here as a numbered series as well, so that a pin bump — which
-replaces the tree wholesale and therefore discards them — can replay them with
-`third_party/patches/apply.sh`, and so that each one maps 1:1 to an upstream PR
-when it is filed.
+The vendored tree carries five local patches, kept here as a numbered series so
+that a pin bump — which replaces the tree wholesale and therefore discards them —
+can replay them with `third_party/patches/apply.sh`, and so that each one maps
+1:1 to an upstream PR when it is filed.
+
+**The pin does not include 005.** The fork commit named in
+[What is actually installed](#what-is-actually-installed) predates it, so a
+fresh `uv pip install` produces an installed copy that disagrees with this tree:
+`DefaultEvaluator` silently drops `matched_ratio` again and every non-lowbit
+task's traces lose their correctness figure. Nothing errors — the column just
+goes empty. After any reinstall, re-apply the series against the installed
+package (or bump the pin) and confirm with the `cmp` loop below, which is the
+only check that catches this.
 
 | Patch | Touches | Why |
 |---|---|---|
@@ -122,6 +128,7 @@ when it is filed.
 | `002-hca-compress-eval-routing` | `bench/evaluators/lowbit.py`, `bench/eval_config.yaml` | Routes `op_type: hca_compress` to `LowBitEvaluator`, which records `matched_ratio` — the quantity this repository's tolerances are derived against — and registers its measured `rtol`/`atol`/`required_matched_ratio` in the bundled per-op_type config. All three must match `tasks/hca_compress_c128/eval_config.yaml`, which is where they are derived: `validate --checks benchmark` reads only the bundled file and cannot be handed the task's, so a tolerance present in one and not the other makes the validator disagree with the runner. Follows upstream's own idiom; `LowBitEvaluator` and `DsaSparseAttentionEvaluator` both hardcode the definitions they claim. |
 | `003-validate-uses-bundled-eval-config` | `data/validate.py` | `check_benchmark_content` built a bare `BenchmarkConfig`, so it never loaded the bundled `eval_config.yaml`. Any definition whose op_type sets a tolerance there was validated at the `compute_error_stats` fallback of 1.0 — bitwise equality — and failed under `validate` while passing under `run`. |
 | `004-validate-prefers-task-eval-config` | `data/validate.py` | 003 made the check read the *bundled* config; this lets it read the *task's*. `check_benchmark_content` takes an `eval_config` argument and `validate_dataset` auto-discovers `<root>/eval_config.yaml`, falling back to the bundled file when there is none. Without it, the only way to make the validator agree with the runner is to copy every task's tolerances into the vendored package — which is exactly what 002 had to do, and which does not scale past one task or survive a pin bump. |
+| `005-default-evaluator-matched-ratio` | `bench/evaluators/default.py` | `DefaultEvaluator` discarded the `matched_ratio` that `compute_error_stats` already returns (it was bound to `_`), so only definitions routed to `LowBitEvaluator` by 002 recorded it. Every other task — `kda_prefill_h32_d128` among them — emitted traces whose `Correctness` carried `max_abs`/`max_rel` but no ratio, leaving `tools/report_traces.py` with nothing to put in its correctness table and no way to see a kernel that is correct almost everywhere. Records the **minimum** across outputs, matching lowbit's convention: a trace fails if any single output falls under `required_matched_ratio`, so the worst output is the figure worth keeping, not a pooled average. |
 
 Note what 004 means for 002: the `hca_compress` block that 002 adds to the
 bundled `eval_config.yaml` is now redundant for *this* task, because
@@ -156,7 +163,7 @@ The tree above is the **reference**, not the import. `pyproject.toml` binds the
 
 | Installed from | Revision | Which is |
 |---|---|---|
-| `https://github.com/TianyiZhao1437/flashinfer-bench` | `19acd0df4a4a3c456db034f4e6c9defc21d91c40` | upstream `40e6ca7` + the three patches above, as one commit |
+| `https://github.com/TianyiZhao1437/flashinfer-bench` | `19acd0df4a4a3c456db034f4e6c9defc21d91c40` | upstream `40e6ca7` + the patch series as it stood when the pin was set — **not** `005`, which landed after |
 
 So the same local changes exist twice, for different purposes:
 
@@ -170,9 +177,9 @@ Neither is derived from the other at install time. They agree by construction,
 and that is the invariant to check after touching either:
 
 ```
-# the four files the patches touch must be identical in both
+# the five files the patches touch must be identical in both
 for f in bench/utils.py bench/evaluators/lowbit.py bench/eval_config.yaml \
-         data/validate.py; do
+         data/validate.py bench/evaluators/default.py; do
   cmp third_party/flashinfer-bench/flashinfer_bench/$f \
       <fork-checkout>/flashinfer_bench/$f || echo "DRIFT: $f"
 done

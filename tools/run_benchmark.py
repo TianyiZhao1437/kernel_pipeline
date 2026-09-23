@@ -48,6 +48,43 @@ import stage_trace_set  # noqa: E402  (needs the path above)
 import flashinfer_bench  # noqa: E402,F401  (registers the real package)
 
 
+def clear_stale_traces(root: pathlib.Path, *, resume: bool, only=None) -> None:
+    """Truncate trace files before a fresh run, because the library appends.
+
+    ``TraceSet.add_traces`` treats traces as an append-only log, so running the
+    benchmark twice leaves two generations of every (workload, solution) pair in
+    the same jsonl. Nothing downstream de-duplicates: ``tools/report_traces.py``
+    counts rows, so a second run silently doubles the workload count and lets a
+    stale trace from a since-fixed kernel set the "worst observed" figures.
+
+    Without ``--resume`` the request is for a fresh measurement, so the old rows
+    go. With it, they are the point and are left alone. ``--solutions`` narrows
+    the run, so it also narrows what is cleared -- a file is only rewritten if it
+    contains a solution being re-run, and only those rows are dropped.
+    """
+    import json
+
+    trace_dir = root / "traces"
+    if not trace_dir.is_dir() or resume:
+        return
+
+    wanted = set(only) if only else None
+    for path in sorted(trace_dir.rglob("*.jsonl")):
+        rows = [line for line in path.read_text().splitlines() if line.strip()]
+        if not rows:
+            continue
+        if wanted is None:
+            keep = []
+        else:
+            keep = [r for r in rows
+                    if json.loads(r).get("solution") not in wanted]
+        if len(keep) == len(rows):
+            continue
+        path.write_text("".join(r + "\n" for r in keep))
+        print(f"cleared {len(rows) - len(keep)} stale trace(s) from "
+              f"{path.relative_to(root)} (pass --resume to keep them)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("task_dir", type=pathlib.Path)
@@ -75,6 +112,8 @@ def main():
     if not args.no_stage:
         stage_trace_set.stage(args.task_dir, root, quiet=True)
         print(f"staged {args.task_dir} -> {root}")
+
+    clear_stale_traces(root, resume=args.resume, only=args.solutions)
 
     from flashinfer_bench.bench import Benchmark, BenchmarkConfig
     from flashinfer_bench.bench.evaluators import resolve_evaluator

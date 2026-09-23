@@ -155,13 +155,58 @@ use the same workload corpus.
    long comment on this: it was pinned at the old 20-workload `hca_c128_v4`, and
    if the model optimises against a smaller sweep than the trace is judged on,
    "the round-by-round feedback the model optimises against is a different — and
-   smaller — sweep than the trace it is finally judged on". Both defaults now
-   agree, and **nothing asserts it**.
-4. **The `benchmark` check's hardcoded config.** `HCA.md` §8 item 8 records that
+   smaller — sweep than the trace it is finally judged on". Both are now derived
+   from `--task-dir` by the `Task` class, so they cannot be set independently;
+   an explicit `--root` still overrides, and **nothing asserts** the override
+   agrees.
+4. **The eval config the *generation* uses.** Distinct from item 2, and worse,
+   because it is silent on both sides. `kernel_generator.py:343` constructs a
+   bare `BenchmarkConfig()` — not `.default()`, not `.from_yaml()` — which loads
+   no eval config at all. Measured on `kda_prefill_h32_d128`:
+
+   | | rtol | atol | required_matched_ratio |
+   |---|---:|---:|---:|
+   | `BenchmarkConfig()` | 0.01 | 0.01 | `None` |
+   | task `eval_config.yaml` | 0.02 | 0.001 | 0.99 |
+
+   `compute_error_stats` reads `None` as **1.0**, i.e. bitwise equality, which no
+   bf16 kernel reaches. Every round of every model would be reported
+   INCORRECT_NUMERICAL and the whole budget spent removing an error the task does
+   not ask to be removed — while `run_benchmark.py`, reading the task's file,
+   would pass the same kernel. `hca_compress_c128` never hit this: patch 002
+   routes it to `LowBitEvaluator`, which carries its own tolerance and never
+   reads the config. Any task on the default evaluator is exposed.
+   `gen_solution_llm.py` now rebinds `kernel_generator.BenchmarkConfig` to the
+   task's file.
+5. **The calling convention is enforced but never stated.** `BuildSpec`
+   defaults `destination_passing_style` to `True`, so a generated solution is
+   validated as `run(*inputs, *outputs) -> None`; the stock prompt says only to
+   "restore devices for outputs", which reads value-returning. A KDA kernel that
+   was otherwise correct died as a `COMPILE_ERROR` before execution:
+
+   ```
+   BuildError: Destination-passing style callable: expected 8 positional
+   parameters, but signature '(query, key, value, g, beta, initial_state=None)'
+   is incompatible: too many positional arguments
+   ```
+
+   There is no task-independent right answer — `hca_compress_c128`'s Triton
+   solutions are DPS and `kda_prefill_h32_d128`'s are value-returning, so the
+   convention has to be read from the task's own solutions in the language being
+   generated, then both told to the model and recorded on the spec.
+6. **The token budget is a correctness surface, not a cost knob.** A ceiling that
+   truncates before the model reaches the code returns `finish_reason=None` with
+   empty content — identical in the log to a dropped reply, and unfixable by
+   retrying. `anthropic/claude-opus-5` on `kda_prefill_h32_d128` burned all 16384
+   completion tokens on reasoning three attempts in a row; the same ceiling is
+   ample for `hca_compress_c128`. A budget validated on one task is not validated
+   for the next, so the empty-reply path must report `finish_reason` and the
+   token counts or the cause is unrecoverable from the log.
+7. **The `benchmark` check's hardcoded config.** `HCA.md` §8 item 8 records that
    the vendored validator's benchmark check carries its own `BenchmarkConfig`, so
    its verdict can disagree with the real run. Either reconcile it or document
    the divergence; do not let two configs disagree silently.
-5. **Target hardware mismatch.** Per `CLAUDE.md` §12 the wheel constraint is set
+8. **Target hardware mismatch.** Per `CLAUDE.md` §12 the wheel constraint is set
    by **compute capability**, not driver version, and the driver is host-injected
    and must not be replaced. A task whose reference needs kernels the declared
    target cannot execute does not fail loudly — it dies at the first GPU op with

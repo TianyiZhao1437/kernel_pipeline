@@ -1,0 +1,12 @@
+{
+  "name": "glm-5.1_kda_prefill_h32_d128_triton_optimized_r7_c0",
+  "author": "glm-5.1",
+  "model": "glm-5.1",
+  "entry_point": "main.py::run",
+  "target_hardware": [
+    "H200"
+  ],
+  "language": "SupportedLanguages.TRITON",
+  "description": "glm-5.1 optimized kernel for kda_prefill_h32_d128 (round 7, candidate 0)",
+  "rounds": 10
+}

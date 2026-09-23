@@ -36,8 +36,12 @@ C2  anti-hack. Static: the entry must not import the reference module, read the
 C3  input realism. Blob presence and digest against the manifest, and a
     physical-consistency probe on the tensors whose declared meaning constrains
     their values: a rotation table must satisfy cos^2 + sin^2 = 1 and |x| <= 1;
-    an RMSNorm gain must be predominantly positive. Both violations were real
-    in this repository and both passed every other check.
+    an RMSNorm gain must be predominantly positive; a log forget rate must be
+    negative and a delta-rule write strength must lie in (0, 1). The first two
+    violations were real in this repository and both passed every other check.
+    The last two are the same failure one op along: `{"type": "random"}` is
+    exactly torch.randn, so an unblobbed gate is positive half the time and the
+    recurrence it drives diverges.
 
 C4  trace-readiness. eval_config present and parseable, generation and
     measurement roots equal, target hardware declared, and the sweep's axis
@@ -529,16 +533,28 @@ def check_tensor_semantics(
 
     # Group by tensor_key so one file is read once even when four workloads share it.
     by_key: Dict[str, Tuple[pathlib.Path, str]] = {}
+    # Every (path, key) per input name, not just the first. The probes below are
+    # split between the two: properties that hold by construction of a shared
+    # table (a rotation cache) are spot-checked on one representative, while
+    # per-workload gate invariants are checked on every workload, because "one
+    # of sixteen was in range" is not the claim those probes are making.
+    all_by_name: Dict[str, List[Tuple[pathlib.Path, str]]] = {}
     for wl in workloads:
         for name, spec in wl.inputs.items():
             if getattr(spec, "type", None) == "safetensors" and spec.path in blobs:
                 by_key.setdefault(f"{name}", (blobs[spec.path], spec.tensor_key))
+                entry = (blobs[spec.path], spec.tensor_key)
+                bucket = all_by_name.setdefault(name, [])
+                if entry not in bucket:
+                    bucket.append(entry)
 
     try:
         import numpy as np
     except ImportError:
         report.add("C3", "tensor semantics", SKIP, "numpy unavailable")
         return
+
+    check_gate_semantics(all_by_name, report)
 
     for name, (path, key) in sorted(by_key.items()):
         try:
@@ -600,6 +616,108 @@ def check_tensor_semantics(
             )
         except Exception as exc:  # noqa: BLE001
             report.add("C3", "tensor semantics (cos/sin pair)", WARN, f"could not read the pair: {exc}")
+
+
+def check_gate_semantics(
+    all_by_name: Dict[str, List[Tuple[pathlib.Path, str]]], report: Report
+) -> None:
+    """Gate invariants for linear-attention ops: ``g < 0`` and ``beta`` in (0, 1).
+
+    These are not style preferences, they are the conditions under which the
+    recurrence ``S_t = (I - b_t k k^T) Diag(exp(g_t)) S_{t-1} + b_t k v^T`` is
+    the operator it claims to be.
+
+    ``g`` is a log forget rate. In Kimi Linear it is produced as
+    ``-exp(A_log) * softplus(...)``, which is negative by construction, and
+    ``exp(g)`` is the per-channel retention per token. A single positive entry
+    makes that factor exceed 1 and the state grows geometrically along the
+    sequence -- at T=16384 a g of +0.01 is a factor of e^164. Nothing in the
+    Definition or the schema forbids it; ``{"type": "random"}`` is exactly
+    ``torch.randn``, which makes half the entries positive, so an unblobbed
+    corpus fails this by construction rather than by accident.
+
+    ``beta`` is the delta-rule write strength, a sigmoid output. Below 0 the
+    update adds the wrong sign; above 1 it over-erases past the exact-removal
+    point and the WY representation's ``(I - A)^-1`` loses its convergence
+    argument.
+
+    The bounds are checked on every workload. The distribution shape is
+    reported but only warned on: a corpus concentrated at one gate value is
+    degenerate, but how degenerate is a judgement, not an invariant.
+    """
+    import numpy as np
+
+    for name, entries in sorted(all_by_name.items()):
+        if name not in ("g", "beta"):
+            continue
+        violations: List[str] = []
+        lo = float("inf")
+        hi = float("-inf")
+        spread: List[float] = []
+        read_failures: List[str] = []
+        for path, key in entries:
+            try:
+                npy = read_safetensors_tensor(path, key).astype(np.float64)
+            except Exception as exc:  # noqa: BLE001
+                read_failures.append(f"{path.name}:{key}: {exc}")
+                continue
+            lo = min(lo, float(npy.min()))
+            hi = max(hi, float(npy.max()))
+            if name == "g":
+                bad = int((npy >= 0).sum())
+                if bad:
+                    violations.append(f"{key}: {bad}/{npy.size} entries >= 0")
+                # exp(g) per token, summarised as the retention over one chunk.
+                spread.append(float(np.exp(npy * 64).mean()))
+            else:
+                bad = int(((npy <= 0) | (npy >= 1)).sum())
+                if bad:
+                    violations.append(f"{key}: {bad}/{npy.size} entries outside (0, 1)")
+                spread.append(float(npy.mean()))
+
+        if read_failures:
+            report.add("C3", f"gate semantics ({name})", WARN,
+                       f"{len(read_failures)} blob(s) unreadable", read_failures[:3])
+        if not spread and not violations:
+            continue
+
+        bound = "g < 0" if name == "g" else "0 < beta < 1"
+        if violations:
+            report.add(
+                "C3", f"gate semantics ({name})", FAIL,
+                f"{len(violations)}/{len(entries)} workload(s) violate {bound} "
+                f"(range [{lo:.4g}, {hi:.4g}])",
+                violations[:5] + [
+                    "exp(g) > 1 makes the recurrence divergent along the sequence"
+                    if name == "g" else
+                    "beta outside (0, 1) is not a sigmoid output; the delta rule's "
+                    "erase step stops being a projection"
+                ],
+            )
+            continue
+
+        stat = ("mean retention over a 64-token chunk"
+                if name == "g" else "mean write strength")
+        report.add(
+            "C3", f"gate semantics ({name})", PASS,
+            f"all {len(entries)} workload(s) satisfy {bound}, range [{lo:.4g}, {hi:.4g}]",
+            [f"{stat}: {min(spread):.4g} .. {max(spread):.4g}"],
+        )
+        # Degeneracy, reported separately because it is a judgement not a bound.
+        if name == "beta" and (max(spread) < 0.05 or min(spread) > 0.95):
+            report.add(
+                "C3", f"gate semantics ({name})", WARN,
+                f"beta is concentrated near {'0' if max(spread) < 0.05 else '1'} "
+                f"(mean {min(spread):.4g} .. {max(spread):.4g}); the delta rule's "
+                "erase term is then almost inert and a kernel can skip it",
+            )
+        if name == "g" and max(spread) < 1e-8:
+            report.add(
+                "C3", "gate semantics (g)", WARN,
+                f"every channel decays to < 1e-8 across one chunk (max mean "
+                f"retention {max(spread):.3g}); the cross-chunk state carries "
+                "nothing and a chunk-local kernel would pass",
+            )
 
 
 def read_safetensors_tensor(path: pathlib.Path, key: str):
