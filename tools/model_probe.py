@@ -339,12 +339,13 @@ def corpus_text() -> str:
     distribution -- and needs no dataset download.
 
     It is a *frozen snapshot*, and that is the point. An earlier version built
-    the corpus live from ``tasks/HCA.md`` plus the installed transformers'
-    ``modeling_deepseek_v4`` source. Both drift: the first is a document this
-    repository edits constantly, making the workload data a function of its own
-    task write-up, and the second changes with a library upgrade. The harvest is
-    memoised on disk, so the drift was invisible -- the cache here was written at
-    12:40 and HCA.md was edited at 13:51 the same day, and nothing said so.
+    the corpus live from this task's own design write-up plus the installed
+    transformers' ``modeling_deepseek_v4`` source. Both drift: the first was a
+    document the repository edited constantly, making the workload data a
+    function of its own task write-up, and the second changes with a library
+    upgrade. The harvest is memoised on disk, so the drift was invisible -- the
+    cache here was written at 12:40 and the write-up was edited at 13:51 the
+    same day, and nothing said so.
 
     Provenance of the snapshot: the concatenation of sixteen files from the
     vendored flashinfer-bench tree at the pin recorded in third_party/VENDOR.md

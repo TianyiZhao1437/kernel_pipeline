@@ -98,9 +98,10 @@ The blobs are a pure function of four things, all pinned:
 
 Two of those were broken until this was written down. ``hash(uuid)`` is salted
 per process, so the "seed" changed on every invocation; and the corpus was built
-live from ``tasks/HCA.md``, making the workload data a function of the task's own
-write-up. Both are fixed, and ``tasks/hca_compress_c128/blobs.sha256`` records
-the digest of every blob so a rebuild can be checked rather than assumed.
+live from the task's own design write-up, making the workload data a function of
+a document the repository was editing. Both are fixed, and
+``tasks/hca_compress_c128/blobs.sha256`` records the digest of every blob so a
+rebuild can be checked rather than assumed.
 
 Regenerating the blobs invalidates every recorded trace: the traces describe
 measurements on specific input bytes. Re-run tools/run_benchmark.py after.

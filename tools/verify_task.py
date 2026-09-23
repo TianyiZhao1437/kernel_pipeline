@@ -872,8 +872,10 @@ def review_items(definition, report: Report) -> None:
         "the reference must be diffed against the library implementation of the op",
         [
             "no automated check can answer 'does this match the semantics the library implements'",
-            "HCA.md 8 item 9 records this as open: vLLM line-by-line vs the native",
-            "DeepseekV4HCACompressor. Every convention checked so far agrees; not all are checked.",
+            "for hca_compress the open case is the reference, written from vLLM, against the",
+            "native transformers DeepseekV4HCACompressor. Every convention checked so far agrees",
+            "-- interleaved pairs, half-width cos/sin, trailing 64 dims rotated, fp32 rotation,",
+            "ape added to the gate before the softmax -- but not all of them are checked.",
         ],
     )
     report.add(

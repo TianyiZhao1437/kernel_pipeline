@@ -33,7 +33,7 @@ the 128-token softmax in different orders -- see eval_config.yaml.
 Full trace over the 20-workload sweep, all PASSED (`tools/run_benchmark.py`,
 then `tools/roofline.py`). The sweep runs on model-derived inputs -- real
 DeepSeek-V4 compressor weights and RoPE tables, real activations lifted from
-DeepSeek-V2-Lite (§7.7 of tasks/HCA.md):
+DeepSeek-V2-Lite (provenance in `tools/gen_workload_blobs.py`):
 
     num_compressed     1      64     256    1024
     latency (ms)   0.0934  0.1338  0.3349  1.2295

@@ -58,7 +58,8 @@ Full trace over the 20-workload sweep, all PASSED (`tools/run_benchmark.py`,
 then `tools/roofline.py`; H200, torch 2.11.0+cu128, peak 4216 GB/s measured as a
 sustained d2d copy). The sweep now runs on model-derived inputs rather than
 `torch.randn` -- real DeepSeek-V4 compressor weights and RoPE tables, real
-activations lifted from DeepSeek-V2-Lite (see §7.7 of tasks/HCA.md):
+activations lifted from DeepSeek-V2-Lite (provenance in
+`tools/gen_workload_blobs.py`):
 
     num_compressed        1      64     256     512    1024
     streamed (MB)       0.3    16.9    67.6   135.1   270.2
@@ -71,7 +72,9 @@ activations lifted from DeepSeek-V2-Lite (see §7.7 of tasks/HCA.md):
 The figures are the same as on the previous all-random sweep to within run-to-run
 noise (best was 1227.6 GB/s / 29.12%), which is the expected result: three of the
 workloads differ *only* in their input distribution, and timing all of them in
-one process puts them within 4% of each other (§7.7 of tasks/HCA.md). Values buy
+one process puts them within 4% of each other in either order, so the harness
+spread measures `torch.compile`'s dispatch/guard state at the moment an
+evaluation runs, not the input distribution. Values buy
 correctness coverage on this op, not performance signal. What does move this
 solution is how many shapes Inductor has already compiled -- see the floor below.
 
@@ -92,4 +95,5 @@ guard overhead.) So the 30% of peak at the top of the sweep is the only figure
 here that measures memory throughput at all, and a candidate kernel has roughly
 two separate targets: beat 0.2 ms of overhead below num_compressed ~= 768, and
 beat 1274 GB/s above it. That split is itself a finding about the workload sweep
--- see §7.6 of tasks/HCA.md.
+-- 17 points along `num_compressed` buy almost nothing once the first ~12 are
+all measuring the same constant.

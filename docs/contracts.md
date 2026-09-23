@@ -25,8 +25,9 @@ vendored validator from a correctly staged root.
 **Checked by.** `tools/validate_task.py` (schema + arity + shape resolution, via
 `fib_shim`) and `tools/validate_dataset.py` (the vendored validator).
 
-**Counterexamples, all real — `HCA.md` §2, "four schema constraints that are not
-in the docs":**
+**Counterexamples, all real.** Each was discovered by running the real parser,
+and each had already been violated by a draft of `hca_compress_c128` that looked
+entirely plausible:
 
 | # | The violation | Why it looks fine |
 |---|---|---|
@@ -54,17 +55,25 @@ the reference's output, aliases a constant, or branches on workload identity.
 checks — **which do not exist in this repository in any form today.** This is the
 largest concrete gap in the pipeline.
 
-**Why the review half cannot be automated.** `HCA.md` §8 item 9 is exactly this
-contract, still open: *"Reconcile the Definition against the now-available native
-`DeepseekV4HCACompressor` line by line. Every convention checked so far agrees,
-but the reference was written from vLLM and has not been diffed against the
-library implementation in full."* No check can answer "does this match the
-semantics the library implements" — only a diff against the library can.
+**Why the review half cannot be automated.** `hca_compress_c128` carries exactly
+this contract, still open: its reference was written from vLLM's
+`fused_compress_quant_cache.py` and has **not** been diffed line by line against
+the native `DeepseekV4HCACompressor` that transformers now ships. Every
+convention checked so far agrees — interleaved pairs, half-width cos/sin, the
+trailing 64 dims rotated, fp32 rotation, `ape` added to the gate before the
+softmax — but "every convention checked" is not "every convention". No check can
+answer "does this match the semantics the library implements" — only a diff
+against the library can. Tracked as row 11 of the gap table in
+`docs/architecture.md` §4.
 
-**The convention trap this contract exists for.** `HCA.md` §2.3 records that
+**The convention trap this contract exists for.** For `hca_compress_c128`,
 RoPE's indexing convention was **resolved, not assumed**: entry `c` reads row
 `c * compress_rate`, the window's boundary token floored to the window start,
-matching vLLM's `(positions // compress_ratio) * compress_ratio`. A one-row-off
+matching vLLM's `(positions // compress_ratio) * compress_ratio`. Using the
+boundary token itself instead is one of the mutations the tolerances reject
+(`matched_ratio` 0.877), as is HF's split-half `rotate_half` in place of GPT-J
+interleaved pairs (0.938). The convention is stated in the Definition's
+`description` and enforced by its reference. A one-row-off
 choice here produces a kernel that is *entirely plausible*, runs at full speed,
 and returns wrong numbers — and every other contract passes it.
 
@@ -93,8 +102,8 @@ declaration.
 **Checked by.** `[auto]` for blob presence and hash (`blobs.sha256`), and for
 internal consistency of constrained values; `[review]` for the declaration.
 
-**The counterexample — `HCA.md` §7.7, and this is the strongest one in the
-repository.** Every workload declared `{"type": "random"}`, and `RandomInput`
+**The counterexample, and this is the strongest one in the repository.** Every
+`hca_compress_c128` workload declared `{"type": "random"}`, and `RandomInput`
 **has no parameters at all** — not a distribution, not a seed, not a scale. So
 "random" means exactly `torch.randn`, and that made:
 
@@ -202,10 +211,13 @@ use the same workload corpus.
    ample for `hca_compress_c128`. A budget validated on one task is not validated
    for the next, so the empty-reply path must report `finish_reason` and the
    token counts or the cause is unrecoverable from the log.
-7. **The `benchmark` check's hardcoded config.** `HCA.md` §8 item 8 records that
-   the vendored validator's benchmark check carries its own `BenchmarkConfig`, so
-   its verdict can disagree with the real run. Either reconcile it or document
-   the divergence; do not let two configs disagree silently.
+7. **The `benchmark` check's hardcoded config.** The vendored validator's
+   benchmark check builds its own `BenchmarkConfig(warmup_runs=2, iterations=5,
+   num_trials=1)` at `validate.py:1071` and never reads the task's
+   `eval_config.yaml`, so `required_matched_ratio` resolves from the evaluator's
+   class default and its verdict can disagree with the real run. Either
+   reconcile it or document the divergence; do not let two configs disagree
+   silently. Tracked as row 9 of the gap table in `docs/architecture.md` §4.
 8. **Target hardware mismatch.** Per `CLAUDE.md` §12 the wheel constraint is set
    by **compute capability**, not driver version, and the driver is host-injected
    and must not be replaced. A task whose reference needs kernels the declared

@@ -3,11 +3,13 @@
 ## 0. Why this document, and what it is not
 
 The repository already *performs* this pipeline for one task. `tools/` has eleven
-scripts that stage, validate, benchmark and score `hca_compress_c128`, and the
-record in `tasks/HCA.md` shows what each of them caught. What is missing is not a
-capability but a **shape**: the steps live in prose and shell history, most paths
-are hardcoded module constants, and nothing connects `tools/gen_solution_llm.py`
-to `tools/run_benchmark.py` except a human remembering the order. (Since this was
+scripts that stage, validate, benchmark and score `hca_compress_c128`, and what
+each of them caught is recorded where it was caught — in the tools' own
+docstrings, in `eval_config.yaml`, and in the solutions' `DESCRIPTION.md`. What
+is missing is not a capability but a **shape**: the steps live in prose and shell
+history, most paths are hardcoded module constants, and nothing connects
+`tools/gen_solution_llm.py` to `tools/run_benchmark.py` except a human
+remembering the order. (Since this was
 written, `gen_solution_llm.py` takes `--task-dir` and derives the rest; the other
 scripts have not followed.)
 
@@ -47,11 +49,12 @@ failed" without reading stage 1's logs.
 
 ## 1. The design principle this whole pipeline exists to enforce
 
-`tasks/HCA.md` §2 is titled *"Four schema constraints that are not in the docs"*
-and every item in it was **discovered by running the real parser, after a draft
-that looked entirely plausible had already violated it**. The same pattern recurs
-in §7.7: random inputs made two of five Definition inputs physically impossible,
-and that was invisible until a real model was probed.
+Four schema constraints of `hca_compress_c128` (catalogued as C1 in
+`docs/contracts.md`) are **not stated in the upstream docs**, and every one of
+them was **discovered by running the real parser, after a draft that looked
+entirely plausible had already violated it**. The same pattern recurs in that
+task's inputs: `{"type": "random"}` made two of five Definition inputs
+physically impossible, and that was invisible until a real model was probed.
 
 The generalisable rule, and the reason for the verifier gate rather than a
 checklist:
@@ -102,10 +105,10 @@ Two rules the step must enforce:
    third-party artifact.
 2. **Search output is never transcribed into the reference.** The reference is
    written against the executable source, then *reconciled* with the math.
-   `HCA.md` §8 item 9 is precisely this reconciliation left open: the reference
-   was written from vLLM and has not been diffed line-by-line against the
-   native `DeepseekV4HCACompressor`. That item is a **gate** in this design, not
-   a nice-to-have.
+   `hca_compress_c128` has precisely this reconciliation left open: its
+   reference was written from vLLM and has not been diffed line-by-line against
+   the native `DeepseekV4HCACompressor` (row 11 below). That is a **gate** in
+   this design, not a nice-to-have.
 
 **Hardware detection** belongs here, and only here. It sets the *default* target
 for everything downstream — the plan's "detect local GPU as default hardware" —
@@ -139,11 +142,13 @@ Components, with the existing tool that builds each:
   `--author` explicitly for generated ones. Conflating the two is the bug that
   comment was written to prevent.
 - **Workloads** — the sweep. Two axes of care: *coverage* (the plan should say
-  which regimes must be represented, and `HCA.md` §7.6 shows why — the sweep was
-  truncated to the middle of the range and the top of the range is where the two
-  shipped solutions diverge by 3.3x) and *the `speedup_factor` floor* (§7.5:
-  small workloads measure op-dispatch overhead, and their `speedup_factor` "must
-  not feed a ranking").
+  which regimes must be represented, and `hca_compress_c128` shows why — its
+  sweep was truncated to the middle of the range, and extending it revealed that
+  the top of the range is where the two shipped solutions diverge by 6.5x while
+  the middle hides it) and *the `speedup_factor` floor* (small workloads measure
+  op-dispatch overhead, and their `speedup_factor` must not feed a ranking:
+  2.86x at `num_compressed = 1` is one Triton launch against fifteen eager ones,
+  not a faster kernel).
 - **`eval_config.yaml`** — tolerances and per-definition config. This is
   **required, not optional**, and `run_benchmark.py`'s docstring records the
   reason: `BenchmarkConfig.default()` bundles `required_matched_ratio: 1.0`,
@@ -206,9 +211,10 @@ numbers are only meaningful relative to the exact bytes stage 1 froze.
 
 Run the reference and the baseline. This is `tools/run_benchmark.py` over a
 root staged by `tools/stage_trace_set.py`, and it produces the first Traces —
-which is also the first *evidence*, because `HCA.md` §7.5 is the record of the
-first trace overturning a premise (the seed solution was 19x off roofline by
-design; see the memory note on why that is deliberate).
+which is also the first *evidence*. On `hca_compress_c128` the first trace
+overturned a premise: the seed solution turned out to be 19x off roofline (222.5
+GB/s against a measured 4218 GB/s peak), which is by design — see the memory
+note on why a deliberately slow seed is the right anchor.
 
 The gate's real content is Step 5, so they are specified together.
 
@@ -239,15 +245,16 @@ check or a one-line generalisation of one:
 5. **Blob integrity** — `blobs.sha256` verifies.
 6. **Runs at all** — reference builds, matches itself at the required ratio, and
    the baseline traces. `validate_dataset.py`'s `benchmark` check does this, but
-   note `HCA.md` §8 item 8: that check carries a **hardcoded `BenchmarkConfig`**,
-   so its verdict must be reconciled against the task's own `eval_config.yaml`
-   or it can disagree with the real run.
+   note that the check carries a **hardcoded `BenchmarkConfig`** and never reads
+   the task's `eval_config.yaml` (row 9 below), so its verdict must be reconciled
+   against that config or it can disagree with the real run.
 
 **Not mechanisable — stays a human sign-off, and the pipeline should say so
 rather than pretend.** "符合实际工程语义" is a judgement. What the pipeline owes
 the reviewer is a *narrow* question with the evidence attached: the provenance
 record (which claims are exact vs synthesised), the open reconciliation items
-(HCA's §8 item 9), and the coverage argument for the sweep. A gate that reports
+(for HCA, the un-diffed `DeepseekV4HCACompressor`), and the coverage argument
+for the sweep. A gate that reports
 "13/13 checks passed" while the semantic question is unanswered is worse than one
 that prints "12 automated checks passed; 1 semantic review outstanding".
 
@@ -335,8 +342,8 @@ the report must not do:
   sizes saturates, so "a kernel can be 30x off roofline and still report a
   respectable 1.2x". Peak must be **measured** (d2d copy, `roofline.py`
   `measure_peak_bandwidth`) — the delivery README is explicit that the 4800 GB/s
-  spec figure "is paper — do not use it", and `HCA.md` was carrying that exact
-  error until it was corrected. Measured peak is 4218 GB/s.
+  spec figure "is paper — do not use it", and the HCA write-up was carrying that
+  exact error until it was corrected. Measured peak is 4218 GB/s.
 - **State which byte model produced the bandwidth**, because a task with a
   `bytes_model.py` and one without are not comparable, and the fp32-staging
   correction that `bytes_model.py` now applies to two of five solutions shifts
@@ -369,10 +376,10 @@ Listed so they can be turned into work items rather than rediscovered.
 | 5 | Anti-hack checks (C2) do not exist in any form | `tools/verify_task.py` |
 | 6 | Input-realism is not a declared, checkable property | `tools/verify_task.py` + `task.yaml` |
 | 7 | Generation root and measurement root can silently diverge | **narrowed** — both derive from `--task-dir`; an explicit `--root` still overrides unchecked |
-| 8 | Four schema constraints live in prose (`HCA.md` §2) | promote to `verify_task.py` checks |
+| 8 | Four schema constraints live in prose (`docs/contracts.md` C1) | promote to `verify_task.py` checks |
 | 9 | `validate.py`'s `benchmark` check carries a hardcoded `BenchmarkConfig` | reconcile, or document the divergence |
 | 10 | No token accounting; `gen_solution_llm.py` extracts `usage` and drops it on the floor | optional, but it is why run cost is unanswerable |
-| 11 | Reference/native reconciliation (C2, `HCA.md` §8 item 9) is open | gate item, currently prose |
+| 11 | Reference/native reconciliation (C2) is open: HCA's reference is written from vLLM, never diffed against `DeepseekV4HCACompressor` | gate item, currently prose |
 
 ## 5. Proposed layout
 
@@ -383,7 +390,7 @@ kernel_pipeline/
 ├── docs/
 │   ├── architecture.md            # this file
 │   ├── contracts.md               # the contract catalogue (C1–C4 + verifiers)
-│   └── op-types/                  # per-op notes (HCA.md §8 item 1 wants one)
+│   └── op-types/                  # per-op notes; hca-compress.mdx still unwritten
 ├── tasks/<task>/
 │   ├── task.yaml                  # C4: identity, target, roots, model provenance, split
 │   ├── PROVENANCE.md              # C2/C3: exact-vs-synthesised, pinned revisions
