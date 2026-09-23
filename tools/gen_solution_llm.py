@@ -163,6 +163,31 @@ def _task_dps(task: "Task", language: str = "triton") -> bool:
 _LAST_FINISH = {"reason": None}
 
 
+def _transport_errors():
+    """The exception types that mean "the connection lost the reply".
+
+    Resolved lazily and defensively: openai's exception module is the one part
+    of its surface this file does not otherwise import, and a version that
+    renames a class should degrade to "retry on connection errors" rather than
+    fail at import time. ``TimeoutError``/``OSError`` are the stdlib floor --
+    httpx and anyio both raise through them -- so the tuple is never empty.
+    """
+    types = [TimeoutError, OSError]
+    try:
+        import openai
+    except ImportError:
+        return tuple(types)
+    for name in ("APITimeoutError", "APIConnectionError", "InternalServerError",
+                 "RateLimitError"):
+        exc = getattr(openai, name, None)
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            types.append(exc)
+    return tuple(types)
+
+
+_TRANSPORT_ERRORS = _transport_errors()
+
+
 def _is_truncated(text: str, finish_reason=None) -> bool:
     """Was this reply cut off mid-answer, rather than merely wrong?
 
@@ -727,6 +752,21 @@ def main() -> int:
                       f"{e}; retrying", flush=True)
                 await asyncio.sleep(min(2 ** attempt, 15))
                 continue
+            except _TRANSPORT_ERRORS as e:
+                # The connection died mid-stream. Same meaning as a dropped
+                # reply -- the transport lost it, the model did not answer
+                # badly -- so it belongs on the same retry path. It was not
+                # there before, and an APITimeoutError on round 2 of a
+                # 10-round Opus run propagated out through gen.generate() and
+                # killed the process, discarding a round that had already
+                # PASSED at 10.52x. These reads stall for 13+ minutes at a
+                # time, so a timeout is an expected event on this route, not
+                # an exceptional one.
+                last_err = e
+                print(f"  transport error (attempt {attempt}/{args.code_retries}): "
+                      f"{type(e).__name__}: {e}; retrying", flush=True)
+                await asyncio.sleep(min(2 ** attempt, 15))
+                continue
             text = result.get("cleaned") or result.get("code") or result.get("raw") or ""
             if text.strip() and _is_truncated(result.get("raw") or text,
                                               _LAST_FINISH.get("reason")):
@@ -778,14 +818,64 @@ def main() -> int:
 
     gen._create_solution_from_code = _make_solution
 
-    solution = gen.generate(trace_set=trace_set, definition=definition, gen_rounds=args.rounds)
-    print(f"\ngenerated solution {solution.name} (author {solution.author})", flush=True)
-
-    # Land it the way this repo keeps solutions: real source files on disk.
+    # Land the destination before generating, not after: the checkpoint hook
+    # below writes into it mid-run.
     src = src_dir
     if not src.is_absolute():
         src = REPO / src
     src.mkdir(parents=True, exist_ok=True)
+
+    # Checkpoint every PASSING round the moment it is scored.
+    #
+    # KernelGenerator accumulates `passing_solutions` in a local of
+    # _sequential_generate_async and only returns the best one after the last
+    # round, so any exception in a later round throws away every round that
+    # already passed. That is not hypothetical: a 10-round Opus run passed
+    # round 1 at 10.52x, then died on a round-2 transport timeout and left
+    # nothing on disk. Rounds cost ~13 minutes each here, so losing them to a
+    # network error is the single most expensive failure this script has.
+    _raw_evaluate = gen._evaluate_solutions
+    _checkpoints = []
+
+    def _evaluate_and_checkpoint(trace_set_, definition_, solutions_, workload_):
+        traces = _raw_evaluate(trace_set_, definition_, solutions_, workload_)
+        for sol, trace in zip(solutions_, traces or []):
+            ev = getattr(trace, "evaluation", None)
+            if ev is None or ev.status.value != "PASSED":
+                continue
+            speedup = ev.performance.speedup_factor
+            slot = len(_checkpoints) + 1
+            ckpt = src / "_rounds" / f"pass{slot:02d}_{speedup:.2f}x"
+            ckpt.mkdir(parents=True, exist_ok=True)
+            for f in sol.sources:
+                (ckpt / pathlib.Path(f.path).name).write_text(f.content)
+            _checkpoints.append((speedup, sol, ckpt))
+            print(f"  checkpointed passing round -> "
+                  f"{ckpt.relative_to(REPO) if ckpt.is_relative_to(REPO) else ckpt}",
+                  flush=True)
+        return traces
+
+    gen._evaluate_solutions = _evaluate_and_checkpoint
+
+    try:
+        solution = gen.generate(trace_set=trace_set, definition=definition,
+                                gen_rounds=args.rounds)
+    except Exception as e:
+        # Fall back to the best checkpoint rather than losing the whole run.
+        # Re-raise when there is nothing to fall back to: a run that never
+        # passed a round has no result, and pretending otherwise would file an
+        # empty solution as if the model had produced one.
+        if not _checkpoints:
+            raise
+        speedup, solution, ckpt = max(_checkpoints, key=lambda c: c[0])
+        print(f"\ngeneration crashed ({type(e).__name__}: {e})", flush=True)
+        print(f"recovered the best of {len(_checkpoints)} passing round(s): "
+              f"{speedup:.2f}x. Rounds after it were not run -- this is a "
+              f"partial result, not a completed {args.rounds}-round run.",
+              flush=True)
+    print(f"\ngenerated solution {solution.name} (author {solution.author})", flush=True)
+
+    # Land it the way this repo keeps solutions: real source files on disk.
     for f in solution.sources:
         out = src / pathlib.Path(f.path).name
         out.write_text(f.content)

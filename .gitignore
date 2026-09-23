@@ -48,5 +48,11 @@ tasks/*/*.real.jsonl
 # reproducible from the commands in the READMEs or deliberately discarded.
 /tmp/
 
+# tools/gen_solution_llm.py checkpoints every round that PASSES, so a crash in a
+# later round does not discard the ones that already worked. These are
+# intermediates of a single run -- the round finally selected is written to the
+# solution directory itself, and that is what gets committed.
+tasks/*/solutions/*/_rounds/
+
 # OS
 .DS_Store
